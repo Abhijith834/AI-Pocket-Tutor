@@ -2,9 +2,10 @@ import os
 import re
 import time
 import concurrent.futures
-from text_extraction import extract_text_without_repetitions, save_text_to_file
-from pdf_metadata import extract_metadata_and_links, extract_images, save_metadata_to_json
-from table_extraction import extract_tables_with_metadata
+from .text_extraction import extract_text_without_repetitions, save_text_to_file
+from .pdf_metadata import extract_metadata_and_links, extract_images, save_metadata_to_json
+from .table_extraction import extract_tables_with_metadata
+
 
 def setup_output_folder(pdf_path):
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -20,7 +21,14 @@ def extract_metadata_and_links_with_text(pdf_path):
     return metadata, page_data
 
 def extract_images_and_update_page_data(pdf_path, output_folder, page_data):
-    return extract_images(pdf_path, output_folder, page_data)
+    """
+    Extracts images from the PDF, updates the page data with image positions and file paths,
+    and returns the updated page data along with the count of images.
+    """
+    images_info = extract_images(pdf_path, output_folder, page_data)
+    image_count = len(images_info)  # Count the extracted images
+    return page_data, image_count
+
 
 def extract_tables(pdf_path):
     return extract_tables_with_metadata(pdf_path)
@@ -52,6 +60,10 @@ def generate_line_pattern(line):
     return rf"{line_pattern}"
 
 def remove_tables_from_text(page_texts, tables_with_metadata):
+    """
+    Checks each line in the table cells for matches in the extracted text, replacing matched
+    table content and providing a detailed summary of matched vs. unmatched lines.
+    """
     for table_data in tables_with_metadata:
         page_num = table_data["page"]
         table_id = table_data["table_id"]
@@ -63,23 +75,24 @@ def remove_tables_from_text(page_texts, tables_with_metadata):
 
         for row in table_content:
             for cell in row:
-                cell_lines = cell.split("\n")
-                for line in cell_lines:
-                    if line.strip():
-                        total_lines += 1
-                        line_pattern = re.compile(generate_line_pattern(line), re.IGNORECASE | re.DOTALL)
-                        
-                        if page_num in page_texts and line_pattern.search(page_texts[page_num]):
-                            matched_lines += 1
-                        else:
-                            unmatched_lines += 1
+                if cell:  # Ensure cell is not None
+                    cell_lines = cell.split("\n")
+                    for line in cell_lines:
+                        if line.strip():
+                            total_lines += 1
+                            line_pattern = re.compile(generate_line_pattern(line), re.IGNORECASE | re.DOTALL)
+                            
+                            if page_num in page_texts and line_pattern.search(page_texts[page_num]):
+                                matched_lines += 1
+                            else:
+                                unmatched_lines += 1
 
         matched_percentage = (matched_lines / total_lines * 100) if total_lines > 0 else 0
 
         if matched_percentage > 50:
             table_patterns = [
-                "\s+".join([generate_line_pattern(line) for line in cell.split("\n")])
-                for row in table_content for cell in row
+                r"\s+".join([generate_line_pattern(line) for line in cell.split("\n") if cell])
+                for row in table_content for cell in row if cell
             ]
             full_table_pattern = re.compile(r"\s*".join(table_patterns), re.IGNORECASE | re.DOTALL)
 
@@ -89,6 +102,7 @@ def remove_tables_from_text(page_texts, tables_with_metadata):
                 )
 
     return page_texts
+
 
 def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data):
     final_text = "\n--- Page ".join([f"{page} ---\n{text}" for page, text in page_texts.items()])
@@ -101,7 +115,6 @@ def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, 
 def process_pdf(pdf_path):
     pdf_name, output_folder = setup_output_folder(pdf_path)
 
-    # Step 1-5: Initial parallel processing
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {}
 
@@ -117,13 +130,11 @@ def process_pdf(pdf_path):
         print("[Step 5] Extracting tables...")
         futures['tables'] = executor.submit(extract_tables, pdf_path)
 
-        # Collect results for Steps 1-5
         page_texts = futures['text'].result()
         metadata, page_data = futures['metadata'].result()
-        page_data = futures['images'].result()
+        page_data, image_count = futures['images'].result()  # Capture image count
         tables_with_metadata = futures['tables'].result()
 
-    # Step 6-7: Parallel processing after Step 5 completion
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {}
 
@@ -133,14 +144,15 @@ def process_pdf(pdf_path):
         print("[Step 7] Removing tables from text...")
         futures['remove_tables'] = executor.submit(remove_tables_from_text, page_texts, tables_with_metadata)
 
-        # Collect results for Steps 6 and 7
         page_data = futures['update_tables'].result()
         page_texts = futures['remove_tables'].result()
 
-    # Step 8: Save final results
     print("[Step 8] Saving extracted text and metadata to output files...")
     save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data)
     print("[Complete] PDF processing finished.")
+
+    return image_count  # Return the image count
+
 
 if __name__ == "__main__":
     pdf_path = "/home/matrix/Desktop/AI Pocket Tutor/10840.pdf"  # Replace with your actual PDF path
