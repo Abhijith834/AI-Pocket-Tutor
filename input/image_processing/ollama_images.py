@@ -10,7 +10,7 @@ def process_image(image_path):
         res = ollama.chat(
             model='llava:7b',
             messages=[
-                {'role': 'user', 'content': 'Describe this image', 'images': [image_path]}
+                {'role': 'user', 'content': 'Describe this image in great detail', 'images': [image_path]}
             ]
         )
         
