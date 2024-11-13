@@ -1,20 +1,24 @@
+import os
 import whisper
-import torch
+from pathlib import Path
 
-# Check if CUDA is available and set device accordingly
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+def process_audio(audio_path):
+    """
+    Transcribes the audio file to text and saves the output in a .txt file in the output folder.
+    """
+    model = whisper.load_model("base")  # Load a pre-trained Whisper model
+    audio_path = str(audio_path)  # Convert Path object to string if needed
 
-# Load the Whisper Medium model and move it to the specified device
-model = whisper.load_model("medium").to(device)
+    # Transcribe the audio
+    result = model.transcribe(audio_path)
+    transcription = result['text']
 
-def interpret_audio(audio_file_path):
-    # Perform transcription on the specified device
-    result = model.transcribe(audio_file_path, fp16=torch.cuda.is_available())
-    
-    print("Transcription:", result['text'])
-    return result
+    # Save the transcription to a text file
+    output_dir = Path("output") / "audio_transcriptions"
+    output_dir.mkdir(parents=True, exist_ok=True)  # Ensure output directory exists
 
-# Example usage
-audio_file_path = "/home/matrix/Desktop/AI Pocket Tutor/AI-Pocket-Tutor/sample_audio/OSR_us_000_0010_8k.wav"
-interpret_audio(audio_file_path)
+    output_file = output_dir / f"{Path(audio_path).stem}_transcription.txt"
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(transcription)
+
+    print(f"Transcription for {audio_path} saved to {output_file}")

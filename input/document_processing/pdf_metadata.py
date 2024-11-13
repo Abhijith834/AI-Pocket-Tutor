@@ -95,6 +95,42 @@ def extract_images(pdf_path, output_folder, page_data):
 
     return page_data
 
+def extract_audio(pdf_path, output_folder, page_data):
+    """
+    Identifies 'Screen' annotations (which may contain multimedia content)
+    and logs their positions in page_data.
+    """
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+
+    for i in range(total_pages):
+        page = doc.load_page(i)
+        page_audios = []
+
+        # Check for annotations that may contain multimedia content
+        for annot in page.annots():
+            try:
+                if annot.type[0] == fitz.PDF_ANNOT_SCREEN:  # Only handle 'Screen' annotations
+                    audio_entry = {
+                        "position": convert_to_serializable(annot.rect),  # Position of the annotation
+                        "annotation_type": annot.type[1],  # Annotation type, e.g., "Screen"
+                        "description": "Possible multimedia content (audio or video)"
+                    }
+                    page_audios.append(audio_entry)
+            except Exception as e:
+                print(f"Error processing annotation on page {i + 1}: {e}")
+
+        # Add possible audio annotations only if present on the page
+        if page_audios:
+            if f"page_{i + 1}" in page_data:
+                page_data[f"page_{i + 1}"]["audios"] = page_audios
+            else:
+                page_data[f"page_{i + 1}"] = {"audios": page_audios}
+
+    print("Identified potential multimedia content on pages with 'Screen' annotations but did not extract due to PyMuPDF limitations.")
+    return page_data
+
+
 def save_metadata_to_json(metadata, page_data, output_folder, pdf_name):
     """
     Combines metadata and page data into a JSON file and saves it.

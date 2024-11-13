@@ -2,9 +2,9 @@ import os
 import re
 import time
 import concurrent.futures
-from .text_extraction import extract_text_without_repetitions, save_text_to_file
-from .pdf_metadata import extract_metadata_and_links, extract_images, save_metadata_to_json
 from .table_extraction import extract_tables_with_metadata
+from .text_extraction import extract_text_without_repetitions, save_text_to_file
+from .pdf_metadata import extract_metadata_and_links, extract_images, extract_audio, save_metadata_to_json
 
 
 def setup_output_folder(pdf_path):
@@ -112,6 +112,13 @@ def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, 
     metadata_json_path = save_metadata_to_json(metadata, page_data, output_folder, pdf_name)
     print(f"[Info] Metadata, links, images, and tables saved to: {metadata_json_path}")
 
+
+# Add audio extraction function
+def extract_audio_and_update_page_data(pdf_path, output_folder, page_data):
+    audio_info = extract_audio(pdf_path, output_folder, page_data)
+    audio_count = sum(len(page.get("audios", [])) for page in page_data.values())  # Count extracted audio files
+    return page_data, audio_count
+
 def process_pdf(pdf_path):
     pdf_name, output_folder = setup_output_folder(pdf_path)
 
@@ -130,28 +137,42 @@ def process_pdf(pdf_path):
         print("[Step 5] Extracting tables...")
         futures['tables'] = executor.submit(extract_tables, pdf_path)
 
-        page_texts = futures['text'].result()
-        metadata, page_data = futures['metadata'].result()
-        page_data, image_count = futures['images'].result()  # Capture image count
-        tables_with_metadata = futures['tables'].result()
+        print("[Step 6] Extracting audio files...")
+        futures['audio'] = executor.submit(extract_audio_and_update_page_data, pdf_path, output_folder, {})
+
+        # Collect results for Steps 1-6
+        try:
+            page_texts = futures['text'].result()
+            metadata, page_data = futures['metadata'].result()
+            page_data, image_count = futures['images'].result()
+            page_data, audio_count = futures['audio'].result()  # Capture audio count
+            tables_with_metadata = futures['tables'].result()
+        except Exception as e:
+            print(f"Error during parallel execution: {e}")
+            return 0, 0  # Return 0 for both counts in case of error
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {}
 
-        print("[Step 6] Updating page data with tables...")
+        print("[Step 7] Updating page data with tables...")
         futures['update_tables'] = executor.submit(update_page_data_with_tables, page_data, tables_with_metadata)
 
-        print("[Step 7] Removing tables from text...")
+        print("[Step 8] Removing tables from text...")
         futures['remove_tables'] = executor.submit(remove_tables_from_text, page_texts, tables_with_metadata)
 
-        page_data = futures['update_tables'].result()
-        page_texts = futures['remove_tables'].result()
+        # Collect results for Steps 7-8
+        try:
+            page_data = futures['update_tables'].result()
+            page_texts = futures['remove_tables'].result()
+        except Exception as e:
+            print(f"Error during post-processing steps: {e}")
 
-    print("[Step 8] Saving extracted text and metadata to output files...")
+    print("[Step 9] Saving extracted text and metadata to output files...")
     save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data)
-    print("[Complete] PDF processing finished.")
+    print(f"[Complete] PDF processing finished. Extracted {image_count} images and {audio_count} audio files.")
 
-    return image_count  # Return the image count
+    return image_count, audio_count  # Return both image and audio counts
+
 
 
 if __name__ == "__main__":
