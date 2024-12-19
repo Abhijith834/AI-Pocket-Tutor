@@ -8,7 +8,7 @@ def process_image(image_path):
     
     if image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
         res = ollama.chat(
-            model='llava:7b',
+            model='llava-llama3:latest',
             messages=[
                 {'role': 'user', 'content': 'Describe this image in great detail', 'images': [image_path]}
             ]

@@ -25,7 +25,9 @@ def convert_to_pdf(input_path):
 
 def convert_with_libreoffice(input_path, output_dir):
     try:
-        cmd = ['libreoffice', '--headless', '--convert-to', 'pdf', '--outdir', str(output_dir), str(input_path)]
+        cmd = [r"C:\Program Files\LibreOffice\program\soffice.exe",
+       '--headless', '--convert-to', 'pdf', '--outdir', str(output_dir), str(input_path)]
+
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         logging.error(f"Conversion failed for {input_path}: {e}")

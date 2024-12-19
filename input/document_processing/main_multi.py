@@ -29,7 +29,6 @@ def extract_images_and_update_page_data(pdf_path, output_folder, page_data):
     image_count = len(images_info)  # Count the extracted images
     return page_data, image_count
 
-
 def extract_tables(pdf_path):
     return extract_tables_with_metadata(pdf_path)
 
@@ -61,48 +60,36 @@ def generate_line_pattern(line):
 
 def remove_tables_from_text(page_texts, tables_with_metadata):
     """
-    Checks each line in the table cells for matches in the extracted text, replacing matched
-    table content and providing a detailed summary of matched vs. unmatched lines.
+    Removes tables from text and replaces them with placeholders.
     """
+    replaced_tables = set()
+
     for table_data in tables_with_metadata:
-        page_num = table_data["page"]
         table_id = table_data["table_id"]
+        page_num = table_data["page"]
         table_content = table_data["table"]
 
-        total_lines = 0
-        matched_lines = 0
-        unmatched_lines = 0
+        if table_id in replaced_tables:
+            continue
 
+        table_lines = []
         for row in table_content:
             for cell in row:
-                if cell:  # Ensure cell is not None
-                    cell_lines = cell.split("\n")
-                    for line in cell_lines:
-                        if line.strip():
-                            total_lines += 1
-                            line_pattern = re.compile(generate_line_pattern(line), re.IGNORECASE | re.DOTALL)
-                            
-                            if page_num in page_texts and line_pattern.search(page_texts[page_num]):
-                                matched_lines += 1
-                            else:
-                                unmatched_lines += 1
+                if cell:
+                    table_lines.extend(cell.split("\n"))
 
-        matched_percentage = (matched_lines / total_lines * 100) if total_lines > 0 else 0
-
-        if matched_percentage > 50:
-            table_patterns = [
-                r"\s+".join([generate_line_pattern(line) for line in cell.split("\n") if cell])
-                for row in table_content for cell in row if cell
-            ]
-            full_table_pattern = re.compile(r"\s*".join(table_patterns), re.IGNORECASE | re.DOTALL)
+        if table_lines:
+            table_pattern = "|".join([re.escape(line.strip()) for line in table_lines if line.strip()])
+            table_regex = re.compile(table_pattern, re.IGNORECASE | re.DOTALL)
 
             if page_num in page_texts:
-                page_texts[page_num], count = full_table_pattern.subn(
-                    f"[See table {table_id} in JSON output]", page_texts[page_num]
-                )
+                page_texts[page_num], num_replacements = table_regex.subn(f"<TABLE|{table_id}>", page_texts[page_num], count=1)
+                if num_replacements > 0:
+                    replaced_tables.add(table_id)
+
+                page_texts[page_num] = table_regex.sub("", page_texts[page_num]).strip()
 
     return page_texts
-
 
 def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data):
     final_text = "\n--- Page ".join([f"{page} ---\n{text}" for page, text in page_texts.items()])
@@ -112,12 +99,28 @@ def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, 
     metadata_json_path = save_metadata_to_json(metadata, page_data, output_folder, pdf_name)
     print(f"[Info] Metadata, links, images, and tables saved to: {metadata_json_path}")
 
-
-# Add audio extraction function
 def extract_audio_and_update_page_data(pdf_path, output_folder, page_data):
     audio_info = extract_audio(pdf_path, output_folder, page_data)
     audio_count = sum(len(page.get("audios", [])) for page in page_data.values())  # Count extracted audio files
     return page_data, audio_count
+
+def add_image_pointers_to_text(page_texts, page_data):
+    """
+    Adds placeholders for images in the text at their approximate positions.
+    """
+    for page_key, data in page_data.items():
+        page_num = int(page_key.split("_")[1])
+        images = data.get("images", [])
+
+        for image in images:
+            img_file_name = os.path.basename(image["file_path"])
+            image_pointer = f"<IMAGE|{img_file_name}>"
+
+            if page_num in page_texts:
+                # Append the image pointer at the end of the page's text
+                page_texts[page_num] += f"\n{image_pointer}"
+
+    return page_texts
 
 def process_pdf(pdf_path):
     pdf_name, output_folder = setup_output_folder(pdf_path)
@@ -131,52 +134,58 @@ def process_pdf(pdf_path):
         print("[Step 3] Extracting metadata and links...")
         futures['metadata'] = executor.submit(extract_metadata_and_links_with_text, pdf_path)
 
+        # Wait for metadata first so we have initial page_data
+        metadata, page_data = futures['metadata'].result()
+        # Remove the metadata future from the dict since it's done
+        del futures['metadata']
+
+        # Now that we have `page_data`, we can pass it to images and audio
         print("[Step 4] Extracting images...")
-        futures['images'] = executor.submit(extract_images_and_update_page_data, pdf_path, output_folder, {})
+        futures['images'] = executor.submit(extract_images_and_update_page_data, pdf_path, output_folder, page_data)
 
         print("[Step 5] Extracting tables...")
         futures['tables'] = executor.submit(extract_tables, pdf_path)
 
         print("[Step 6] Extracting audio files...")
-        futures['audio'] = executor.submit(extract_audio_and_update_page_data, pdf_path, output_folder, {})
+        futures['audio'] = executor.submit(extract_audio_and_update_page_data, pdf_path, output_folder, page_data)
 
-        # Collect results for Steps 1-6
-        try:
-            page_texts = futures['text'].result()
-            metadata, page_data = futures['metadata'].result()
-            page_data, image_count = futures['images'].result()
-            page_data, audio_count = futures['audio'].result()  # Capture audio count
-            tables_with_metadata = futures['tables'].result()
-        except Exception as e:
-            print(f"Error during parallel execution: {e}")
-            return 0, 0  # Return 0 for both counts in case of error
+        # Also wait for text
+        page_texts = futures['text'].result()
+        del futures['text']
 
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = {}
+        # Collect results for images, audio, tables
+        tables_with_metadata = futures['tables'].result()
+        del futures['tables']
 
-        print("[Step 7] Updating page data with tables...")
-        futures['update_tables'] = executor.submit(update_page_data_with_tables, page_data, tables_with_metadata)
+        page_data_images, image_count = futures['images'].result()
+        del futures['images']
 
-        print("[Step 8] Removing tables from text...")
-        futures['remove_tables'] = executor.submit(remove_tables_from_text, page_texts, tables_with_metadata)
+        page_data_audio, audio_count = futures['audio'].result()
+        del futures['audio']
 
-        # Collect results for Steps 7-8
-        try:
-            page_data = futures['update_tables'].result()
-            page_texts = futures['remove_tables'].result()
-        except Exception as e:
-            print(f"Error during post-processing steps: {e}")
+    # Merge page_data from images and audio back into the main page_data
+    # page_data_images and page_data_audio should be merging updates into the main page_data
+    page_data.update(page_data_images)
+    page_data.update(page_data_audio)
+
+    # Now we have a unified page_data with metadata, images, and audio
+    page_data = update_page_data_with_tables(page_data, tables_with_metadata)
+
+    # At this point, page_data should contain 'images' arrays for pages
+    page_texts = add_image_pointers_to_text(page_texts, page_data)
+
+    page_texts = remove_tables_from_text(page_texts, tables_with_metadata)
 
     print("[Step 9] Saving extracted text and metadata to output files...")
     save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data)
     print(f"[Complete] PDF processing finished. Extracted {image_count} images and {audio_count} audio files.")
 
-    return image_count, audio_count  # Return both image and audio counts
+    return image_count, audio_count
 
 
 
 if __name__ == "__main__":
-    pdf_path = "/home/matrix/Desktop/AI Pocket Tutor/10840.pdf"  # Replace with your actual PDF path
+    pdf_path = "AI-Pocket-Tutor/Sentimental Analysis.pdf"  # Replace with your actual PDF path
     start_time = time.time()
     print("[Step 1] Setting up output folder...")
     process_pdf(pdf_path)
