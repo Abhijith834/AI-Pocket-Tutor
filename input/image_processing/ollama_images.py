@@ -3,7 +3,7 @@ import ollama
 from pathlib import Path
 
 def process_image(image_path):
-    image_path = str(image_path)  # Convert PosixPath to string
+    image_path = str(image_path)
     output_dir = os.path.dirname(image_path)
     
     if image_path.lower().endswith(('.png', '.jpg', '.jpeg')):

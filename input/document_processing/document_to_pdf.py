@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 import logging
 
-# Set up logging
 logging.basicConfig(filename='conversion.log', level=logging.INFO)
 
 def convert_to_pdf(input_path):
@@ -16,7 +15,7 @@ def convert_to_pdf(input_path):
     elif input_path.suffix.lower() in ['.png', '.jpg', '.jpeg']:
         convert_image_to_pdf(input_path, output_path)
     elif input_path.suffix.lower() == '.pdf':
-        return input_path  # Return if already PDF
+        return input_path
     else:
         print(f"Unsupported format for {input_path}")
         return None

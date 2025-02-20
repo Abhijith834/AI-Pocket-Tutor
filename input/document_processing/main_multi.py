@@ -1,14 +1,12 @@
 import os
 import re
 import concurrent.futures
-
 from .table_extraction import extract_tables_with_metadata
 from .text_extraction import extract_text_without_repetitions, save_text_to_file
 from .pdf_metadata import extract_metadata_and_links, extract_images, extract_audio, save_metadata_to_json
+import logging
+logging.getLogger("chromadb").setLevel(logging.ERROR)
 
-###########################################
-# Helper functions for PDF ingestion.
-###########################################
 
 def setup_output_folder(pdf_path):
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -74,10 +72,6 @@ def remove_excess_newlines(page_texts):
         page_texts[page_num] = text.strip()
     return page_texts
 
-###########################################
-# Semantic chunking: meaningfully reduce chunk size.
-###########################################
-
 def chunk_text_semantic(text, max_words=200):
     """
     Split text into semantically meaningful chunks.
@@ -126,10 +120,6 @@ def chunk_text_semantic(text, max_words=200):
         chunks.append(" ".join(current_chunk))
     return chunks
 
-###########################################
-# Multiprocessing for image description insertion (using ThreadPoolExecutor to save memory).
-###########################################
-
 def process_and_get_image_description(image_file):
     try:
         from image_processing import ollama_images
@@ -161,9 +151,7 @@ def deduplicate_images(image_list):
 def process_images_and_update_page_data(pdf_path, output_folder, page_data):
     from .pdf_metadata import extract_images
     updated_page_data = page_data.copy()
-    # Extract images will update updated_page_data in place.
     _ = extract_images(pdf_path, output_folder, updated_page_data)
-    # Deduplicate images for each page.
     for key, data in updated_page_data.items():
         if "images" in data:
             data["images"] = deduplicate_images(data["images"])
@@ -179,10 +167,6 @@ def process_images_and_update_page_data(pdf_path, output_folder, page_data):
             image["description"] = description
     total_images = sum(len(data.get("images", [])) for data in updated_page_data.values())
     return updated_page_data, total_images
-
-###########################################
-# ChromaDB insertion helpers.
-###########################################
 
 def add_chunks_to_chromadb(collection, pdf_name, page_num, chunks):
     if not chunks:
@@ -208,7 +192,6 @@ def add_chunks_to_chromadb(collection, pdf_name, page_num, chunks):
             metadatas=metadatas_to_add,
             ids=ids_to_add
         )
-        print(f"[ChromaDB] Added {len(documents_to_add)} chunks for page {page_num} of {pdf_name}.")
 
 def add_image_pointers_with_descriptions(page_texts, page_data):
     for page_key, data in page_data.items():
@@ -240,10 +223,6 @@ def extract_audio_and_update_page_data(pdf_path, output_folder, page_data):
     audio_info = extract_audio(pdf_path, output_folder, page_data)
     audio_count = sum(len(page.get("audios", [])) for page in page_data.values())
     return page_data, audio_count
-
-###########################################
-# Main PDF processing function.
-###########################################
 
 def process_pdf(pdf_path, collection=None):
     pdf_name, output_folder = setup_output_folder(pdf_path)
@@ -283,7 +262,3 @@ def process_pdf(pdf_path, collection=None):
             chunks = chunk_text_semantic(text, max_words=200)
             add_chunks_to_chromadb(collection, pdf_name, page_num, chunks)
     return image_count, audio_count
-
-if __name__ == "__main__":
-    pdf_path = "AI-Pocket-Tutor/Sentimental Analysis.pdf"
-    process_pdf(pdf_path)

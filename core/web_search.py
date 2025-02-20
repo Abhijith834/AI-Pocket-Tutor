@@ -1,5 +1,3 @@
-# core/web_search.py
-
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
@@ -7,8 +5,10 @@ import wikipedia
 from dateutil import parser as date_parser
 from datetime import datetime
 import ollama
-
 import sys_msgs
+import core.config as config
+from core.db_utils import remove_think_clauses
+from core import db_utils
 
 def extract_publication_date(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -73,7 +73,8 @@ def duckduckgo_search(query: str):
         containers = soup.find_all("div", class_="result")
     results = []
     for i, div in enumerate(containers):
-        if i > 9:
+        # Limit to 5 results
+        if i > 4:
             break
         a_tag = div.find("a", class_="result__a")
         if not a_tag:
@@ -101,8 +102,19 @@ def wikipedia_flow(query: str) -> str:
             print("[Web] No Wikipedia pages found.")
             return ""
         page_title = results[0]
+        try:
+            page = wikipedia.page(page_title)
+            page_url = page.url
+        except Exception as e:
+            print(f"[Web] Error retrieving page URL: {e}")
+            page_url = "URL not available"
         summary_text = wikipedia.summary(page_title, sentences=5)
-        return f"**Wikipedia Page**: {page_title}\n\n{summary_text}"
+        summary_text = remove_think_clauses(summary_text)
+        return (
+            f"**Wikipedia Page**: [{page_title}]({page_url})\n\n"
+            f"{summary_text}\n\n"
+            f"Reference: This information was retrieved from Wikipedia using the query: '{query}'."
+        )
     except Exception as e:
         print(f"[Web] Error during Wikipedia retrieval: {e}")
         return ""
@@ -120,13 +132,15 @@ def summarize_article_content(content: str, query: str, pub_date_str: str, link:
         "Provide a concise summary focusing on the most important details relevant to the query."
     )
     resp = ollama.chat(
-        model="llama3.1",
+        model=config.MODEL,
         messages=[
             {"role": "system", "content": sys_msg},
             {"role": "user", "content": prompt_text}
         ]
     )
-    return resp["message"]["content"].strip()
+    raw_summary = resp["message"]["content"].strip()
+    clean_summary = remove_think_clauses(raw_summary)
+    return clean_summary
 
 def gather_news_articles(query: str) -> str:
     ddg_results = duckduckgo_search(query)
@@ -160,78 +174,93 @@ def gather_news_articles(query: str) -> str:
         )
     return "\n".join(combined_summary)
 
-# At the top of core/web_search.py (after your imports)
-from core import db_utils
-def get_recent_user_queries(num_messages: int = 2) -> str:
+def refine_external_query(current_query: str, previous_query: str) -> str:
     """
-    Extracts the last `num_messages` user queries from the chat history (ignoring assistant messages)
-    and returns them concatenated into a single string.
+    Uses an LLM-based agent to combine a previous external search query with the current query,
+    producing a refined, concise search query that captures both contexts.
     """
-    from core import db_utils
-    # Filter only user messages
-    user_msgs = [msg["content"] for msg in db_utils.chat_history if msg["role"] == "user"]
-    recent_queries = user_msgs[-num_messages:]  # take last two queries
-    # Concatenate with a space; you can adjust formatting if desired.
-    return " ".join(recent_queries).strip()
-
-
-def refine_search_query(user_input: str) -> str:
-    """
-    Creates a concise external search query using only the recent user queries.
-    """
-    recent_context = get_recent_user_queries(num_messages=2)
-    # For a more concise query, you might simply return the latest user query.
-    # Alternatively, if you want to combine them, you can do:
-    refined = recent_context  # Using only user messages for brevity
-    return refined
+    prompt = (
+        f"Previous external search query: {previous_query}\n"
+        f"Current user query: {current_query}\n\n"
+        "Generate a concise combined search query that incorporates both contexts and is suitable for a search engine. "
+        "Do not include any quotation marks or extra commentary."
+    )
+    resp = ollama.chat(
+        model=config.MODEL,
+        messages=[
+            {"role": "system", "content": sys_msgs.web_query_generator_msg},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    new_query = resp["message"]["content"].strip()
+    new_query = remove_think_clauses(new_query)
+    new_query = new_query.replace('"', '').replace("'", "").strip()
+    print(f"[refine_external_query] Generated refined query: '{new_query}'")
+    return new_query
 
 def generate_web_search_query(user_input: str) -> str:
     """
-    Uses an LLM-based agent to generate a concise and effective search query
-    based on recent conversation context and the current user query.
+    Uses an LLM-based agent to generate a concise search query based on the
+    recent user queries and the current user query. Any quotation marks are removed.
     """
-    from core import db_utils  # to access global chat_history
-    # Extract the last 2 user messages from chat history.
     user_msgs = [msg["content"] for msg in db_utils.chat_history if msg["role"] == "user"]
     recent_context = " ".join(user_msgs[-2:]).strip() if user_msgs else ""
-    
-    # Construct the prompt for the query generator agent.
-    prompt = f"Conversation context: {recent_context}\nCurrent query: {user_input}\n\nGenerate a concise search query for retrieving up-to-date information:"
-    
+
+    prompt = (
+        f"Conversation context: {recent_context}\n"
+        f"Current query: {user_input}\n\n"
+        "Generate a concise search query suitable for a search engine. "
+        "Do not include quotation marks or extra commentary."
+    )
     resp = ollama.chat(
-        model="llama3.1",
+        model=config.MODEL,
         messages=[
             {"role": "system", "content": sys_msgs.web_query_generator_msg},
             {"role": "user", "content": prompt}
         ]
     )
     query = resp["message"]["content"].strip()
-    # Remove any leading and trailing double quotes.
-    if query.startswith('"') and query.endswith('"'):
-        query = query[1:-1].strip()
+    query = remove_think_clauses(query)
+    query = query.replace('"', '').replace("'", "").strip()
     print(f"[generate_web_search_query] Generated query: '{query}'")
     return query
 
+last_external_context = ""
 
 def web_search_flow(user_input: str) -> str:
-    # Use the dedicated agent to generate a refined search query.
-    refined_query = generate_web_search_query(user_input)
+    """
+    Main entry point for an external web search. If a previous query is stored,
+    we refine it with the current user query. Otherwise, we generate a fresh query.
+    Then we pass this query to the source-decider agent and subsequently to
+    Wikipedia or DuckDuckGo news search.
+    """
+    global last_external_context
+
+    if last_external_context:
+        refined_query = refine_external_query(user_input, last_external_context)
+    else:
+        refined_query = generate_web_search_query(user_input)
+
     print(f"[web_search_flow] Final search query: '{refined_query}'")
-    
-    # Ask the source-deciding agent with the refined query.
+
     resp = ollama.chat(
-        model="llama3.1",
+        model=config.MODEL,
         messages=[
             {"role": "system", "content": sys_msgs.source_decider_msg},
             {"role": "user", "content": refined_query}
         ]
     )
-    source = resp["message"]["content"].strip().lower()
+    raw_source = resp["message"]["content"].strip()
+    raw_source = remove_think_clauses(raw_source)
+    source = raw_source.lower()
     print(f"[web_search_flow] source-decider agent says: '{source}'")
-    
-    # Depending on the source-decider output, use Wikipedia or news search.
+
     if source == "wiki":
         result = wikipedia_flow(refined_query)
     else:
         result = gather_news_articles(refined_query)
+
+    if result.strip():
+        last_external_context = refined_query
+
     return result

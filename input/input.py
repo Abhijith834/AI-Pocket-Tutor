@@ -1,24 +1,21 @@
 import os
 import re
+import sys
 import subprocess
 from pathlib import Path
-
-# Import our document, image, and audio processing modules.
 from document_processing import main_multi, document_to_pdf as documents_to_pdf
 from image_processing import ollama_images
 from audio_processing.whisper_medium import process_audio
-
-# ============= CHROMADB ADDITIONS =============
 import chromadb
 from sentence_transformers import SentenceTransformer
+import logging
+logging.getLogger("chromadb").setLevel(logging.ERROR)
 
-CHROMA_DB_DIR = "chromadb_storage"
+CHROMA_DB_DIR = os.getenv("CHROMA_DB_DIR", "chromadb_storage")
 client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
 
-# Load the embedding model.
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Define a callable class that meets the required embedding function signature.
 class ChromaEmbeddingFunction:
     def __call__(self, input):
         """Accepts a list of strings and returns a list of embeddings."""
@@ -45,10 +42,14 @@ def sanitize_collection_name(name):
     if not name:
         name = "default"
     return name
-# ============= END CHROMADB ADDITIONS =============
 
 def process_input(input_path):
+    """
+    Determines whether the user provided a file or a directory, 
+    and processes accordingly.
+    """
     input_path = Path(input_path)
+    print(f"[Debug] Input path: {input_path}")
     if input_path.is_dir():
         for file in input_path.rglob('*'):
             if file.is_file():
@@ -59,7 +60,12 @@ def process_input(input_path):
         print(f"Invalid input path: {input_path}")
 
 def process_file(file_path):
+    """
+    Checks the extension of the file and dispatches the appropriate
+    processing function.
+    """
     file_extension = file_path.suffix.lower()
+    print(f"[Debug] Detected file extension: {file_extension}")
     if file_extension in ['.png', '.jpg', '.jpeg']:
         print(f"Processing image: {file_path}")
         pdf_path = documents_to_pdf.convert_to_pdf(file_path)
@@ -86,25 +92,20 @@ def process_pdf_file(pdf_path):
     """
     For each PDF, create a dedicated ChromaDB collection using the sanitized PDF name.
     Then call main_multi.process_pdf (which handles text, images, audio, and metadata extraction)
-    so that the text (augmented with image descriptions) is split into meaningful chunks
-    and inserted into the collection.
+    so that the text is split into meaningful chunks and inserted into the collection.
     """
     pdf_name = Path(pdf_path).stem
     sanitized_name = sanitize_collection_name(pdf_name)
+    print(f"[Debug] PDF base name: {pdf_name} -> Sanitized name: {sanitized_name}")
     pdf_collection = client.get_or_create_collection(
         name=sanitized_name,
         embedding_function=embedding_function
     )
-    # Process the PDF and insert its chunks into the dedicated collection.
     image_count, audio_count = main_multi.process_pdf(pdf_path, pdf_collection)
 
 if __name__ == '__main__':
-    # Start the Ollama application as a background process (if needed).
-    ollama_app_path = r"C:\Users\abhij\AppData\Local\Programs\Ollama\ollama app.exe"
-    ollama_process = subprocess.Popen([ollama_app_path])
-    
-    input_path = 'AI-Pocket-Tutor\\Sentimental Analysis.pdf'  # Replace with your actual input path.
-    process_input(input_path)
-    
-    # After processing, unload the Ollama model.
-    subprocess.run(["taskkill", "/F", "/IM", "ollama_llama_server.exe"], check=False)
+    if len(sys.argv) > 1:
+        user_path = sys.argv[1]
+        process_input(user_path)
+    else:
+        print("[Info] No path argument provided to input.py")

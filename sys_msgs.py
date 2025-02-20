@@ -15,8 +15,6 @@ search_or_not_msg = (
     "Otherwise, output 'False'. No extra words, only 'True' or 'False'."
 )
 
-
-
 source_decider_msg = (
     "You are a source-deciding agent. Determine whether the user's query is primarily seeking knowledge-based information "
     "(such as definitions, explanations, or background details) or if it is asking for up-to-date news and recent developments. "
@@ -49,4 +47,5 @@ web_query_generator_msg = (
     "You are a search query generator agent. Given the conversation context and the user's current query, "
     "generate a concise and effective search query that a user would enter in a search engine would use to retrieve up-to-date and relevant information. "
     "Do not simply repeat the conversation verbatim or duplicate the current query. Output only the final search query."
+    "Do not include any quotation marks or extra commentary; output only the final query text."
 )
