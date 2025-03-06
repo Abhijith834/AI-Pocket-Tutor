@@ -38,6 +38,13 @@ os.environ["SESSION_ID"] = session_id
 print(f"Using chat session: {session_id}")
 print(f"Session folder: {session_folder}")
 
-from core import chat
+from core import chat, db_utils
+
+# If resuming an existing session, load memory summary
+memory_file = os.path.join(session_folder, "memory_summary.txt")
+if os.path.exists(memory_file):
+    db_utils.load_memory_summary()
+    print("[Main] Loaded memory summary for this session.")
+
 if __name__ == "__main__":
     chat.main()

@@ -15,6 +15,10 @@ active_collection = None
 active_collection_name = None
 chat_history = []
 
+# New globals for long-term memory
+memory_summary = ""
+memory_included = False
+
 def embed_query(query_text: str):
     return query_model.encode([query_text]).tolist()[0]
 
@@ -112,7 +116,15 @@ def auto_summarize_and_suggest():
 
 def normal_ollama_chat(user_input: str) -> str:
     import ollama
-    prompt = f"You are an AI assistant.\n\nUser: {user_input}\n\nAssistant:"
+    global memory_included, memory_summary
+    if memory_summary and not memory_included:
+         prompt = (
+             f"You are an AI assistant. Here is your long-term memory from previous conversations:\n{memory_summary}\n\n"
+             f"User: {user_input}\n\nAssistant:"
+         )
+         memory_included = True
+    else:
+         prompt = f"You are an AI assistant.\n\nUser: {user_input}\n\nAssistant:"
     try:
         out = ollama.generate(model=MODEL, prompt=prompt)
         response_text = out.get("response", "No response")
@@ -152,3 +164,58 @@ def rag_ollama_chat(user_input: str) -> str:
         return response_text
     except Exception as e:
         return f"(Error generating RAG answer) {e}"
+
+def get_session_folder():
+    return os.path.dirname(os.getenv("CHAT_HISTORY_FILE", os.getcwd()))
+
+def load_memory_summary():
+    global memory_summary
+    mem_file = os.path.join(get_session_folder(), "memory_summary.txt")
+    if os.path.exists(mem_file):
+        try:
+            with open(mem_file, "r", encoding="utf-8") as f:
+                memory_summary = f.read().strip()
+        except Exception as e:
+            print(f"[DB] Error loading memory summary: {e}")
+    return memory_summary
+
+def save_memory_summary():
+    mem_file = os.path.join(get_session_folder(), "memory_summary.txt")
+    try:
+        with open(mem_file, "w", encoding="utf-8") as f:
+            f.write(memory_summary)
+    except Exception as e:
+        print(f"[DB] Could not save memory summary: {e}")
+
+def update_memory_summary(new_messages):
+    global memory_summary
+    new_text = build_chunk_text(new_messages)
+    prompt = (
+        "You are an AI assistant maintaining a long-term memory of a conversation. "
+        "You already have an existing memory summary (which compresses older parts) and now you have new conversation turns.\n\n"
+        f"Existing Memory Summary:\n{memory_summary if memory_summary else '[None]'}\n\n"
+        f"New Conversation Turns:\n{new_text}\n\n"
+        "Update the memory summary so that older parts are very brief and the new parts are described in detail. "
+        "Output only the updated memory summary."
+    )
+    import ollama
+    try:
+        resp = ollama.generate(model=MODEL, prompt=prompt)
+        updated = resp.get("response", "[No memory update]")
+        memory_summary = updated.strip()
+        save_memory_summary()
+        print("[DB] Memory summary updated.")
+    except Exception as e:
+        print(f"[DB] Error updating memory summary: {e}")
+    return memory_summary
+
+def build_chunk_text(messages):
+    """
+    Helper function to build text from a list of messages.
+    """
+    lines = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        lines.append(f"{role.upper()}: {content}")
+    return "\n".join(lines)

@@ -1,3 +1,5 @@
+# core/web_search.py
+
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
@@ -73,8 +75,7 @@ def duckduckgo_search(query: str):
         containers = soup.find_all("div", class_="result")
     results = []
     for i, div in enumerate(containers):
-        # Limit to 5 results
-        if i > 4:
+        if i > 4:  # Limit to 5 results
             break
         a_tag = div.find("a", class_="result__a")
         if not a_tag:
@@ -101,20 +102,23 @@ def wikipedia_flow(query: str) -> str:
         if not results:
             print("[Web] No Wikipedia pages found.")
             return ""
-        page_title = results[0]
-        try:
-            page = wikipedia.page(page_title)
-            page_url = page.url
-        except Exception as e:
-            print(f"[Web] Error retrieving page URL: {e}")
-            page_url = "URL not available"
-        summary_text = wikipedia.summary(page_title, sentences=5)
-        summary_text = remove_think_clauses(summary_text)
-        return (
-            f"**Wikipedia Page**: [{page_title}]({page_url})\n\n"
-            f"{summary_text}\n\n"
-            f"Reference: This information was retrieved from Wikipedia using the query: '{query}'."
-        )
+        # Try each result until one yields a valid page.
+        for page_title in results:
+            try:
+                page = wikipedia.page(page_title)
+                page_url = page.url
+                summary_text = wikipedia.summary(page_title, sentences=5)
+                summary_text = remove_think_clauses(summary_text)
+                return (
+                    f"**Wikipedia Page**: [{page_title}]({page_url})\n\n"
+                    f"{summary_text}\n\n"
+                    f"Reference: This information was retrieved from Wikipedia using the query: '{query}'."
+                )
+            except Exception as e:
+                print(f"[Web] Error retrieving page for '{page_title}': {e}")
+                continue
+        print("[Web] No valid Wikipedia page could be retrieved.")
+        return ""
     except Exception as e:
         print(f"[Web] Error during Wikipedia retrieval: {e}")
         return ""
@@ -219,20 +223,27 @@ def generate_web_search_query(user_input: str) -> str:
             {"role": "user", "content": prompt}
         ]
     )
-    query = resp["message"]["content"].strip()
-    query = remove_think_clauses(query)
-    query = query.replace('"', '').replace("'", "").strip()
-    print(f"[generate_web_search_query] Generated query: '{query}'")
-    return query
+    raw_query = resp["message"]["content"].strip()
+    raw_query = db_utils.remove_think_clauses(raw_query).replace('"', '').replace("'", "").strip()
 
+    import re
+    user_mentioned_year = bool(re.search(r"\b\d{4}\b", user_input))
+    if not user_mentioned_year:
+        # Remove any 4-digit year from the final query if user didn't explicitly mention it
+        raw_query = re.sub(r"\b\d{4}\b", "", raw_query)
+
+    final_query = " ".join(raw_query.split())  # normalize spaces
+    print(f"[generate_web_search_query] Generated query: '{final_query}'")
+    return final_query
+
+# Global variable to store the last external query
 last_external_context = ""
 
 def web_search_flow(user_input: str) -> str:
     """
     Main entry point for an external web search. If a previous query is stored,
-    we refine it with the current user query. Otherwise, we generate a fresh query.
-    Then we pass this query to the source-decider agent and subsequently to
-    Wikipedia or DuckDuckGo news search.
+    refine it with the current user query; otherwise, generate a fresh query.
+    Then pass this query to the source-deciding agent and subsequently use Wikipedia or DuckDuckGo news search.
     """
     global last_external_context
 
