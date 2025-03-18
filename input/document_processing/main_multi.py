@@ -1,16 +1,21 @@
 import os
 import re
 import concurrent.futures
+
 from .table_extraction import extract_tables_with_metadata
-from .text_extraction import extract_text_without_repetitions, save_text_to_file
-from .pdf_metadata import extract_metadata_and_links, extract_images, extract_audio, save_metadata_to_json
+from .text_extraction import extract_text_without_repetitions
+from .pdf_metadata import extract_metadata_and_links, extract_images, extract_audio
 import logging
+
 logging.getLogger("chromadb").setLevel(logging.ERROR)
 
-
-def setup_output_folder(pdf_path):
+def setup_output_folder(pdf_path, chat_session_folder):
+    """
+    Instead of 'output/<pdf_name>', store the extracted content
+    in the chat session folder so each chat has its own separate output.
+    """
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    output_folder = os.path.join("output", pdf_name)
+    output_folder = os.path.join(chat_session_folder, f"{pdf_name}_extracted")
     os.makedirs(output_folder, exist_ok=True)
     return pdf_name, output_folder
 
@@ -74,10 +79,10 @@ def remove_excess_newlines(page_texts):
 
 def chunk_text_semantic(text, max_words=200):
     """
-    Split text into semantically meaningful chunks.
-    1. Split text into paragraphs using two or more newlines.
-    2. Merge paragraphs until reaching approximately max_words words.
-    3. If a paragraph is too long, split it by sentence boundaries.
+    Split text into semantically meaningful chunks:
+      1. Split text by double newlines into paragraphs.
+      2. Merge paragraphs up to ~max_words.
+      3. If a paragraph alone is too big, split by sentence boundaries.
     """
     paragraphs = re.split(r'\n{2,}', text)
     chunks = []
@@ -121,23 +126,23 @@ def chunk_text_semantic(text, max_words=200):
     return chunks
 
 def process_and_get_image_description(image_file):
+    """
+    Calls ollama_images.process_image(image_file) to generate a description
+    but does not rely on reading/writing separate .txt. Instead returns the text.
+    """
     try:
         from image_processing import ollama_images
-        ollama_images.process_image(image_file)
+        desc = ollama_images.process_image(image_file)
+        if desc is None:
+            desc = ""
+        return desc
     except Exception as e:
         print(f"Error processing image {image_file}: {e}")
         return ""
-    description_file = os.path.splitext(image_file)[0] + ".txt"
-    desc_text = ""
-    if os.path.exists(description_file):
-        with open(description_file, "r", encoding="utf-8") as f:
-            desc_text = f.read().strip()
-            desc_text = " ".join(desc_text.split())
-    return desc_text
 
 def deduplicate_images(image_list):
     """
-    Remove duplicate images from the list based on the file path.
+    If the same 'file_path' is repeated, keep only the first occurrence.
     """
     seen = set()
     unique_images = []
@@ -149,12 +154,19 @@ def deduplicate_images(image_list):
     return unique_images
 
 def process_images_and_update_page_data(pdf_path, output_folder, page_data):
+    """
+    Extract images, deduplicate by file path, then concurrently call
+    process_and_get_image_description to fetch a text caption for each.
+    """
     from .pdf_metadata import extract_images
     updated_page_data = page_data.copy()
-    _ = extract_images(pdf_path, output_folder, updated_page_data)
+    extract_images(pdf_path, output_folder, updated_page_data)
+
+    # Deduplicate images
     for key, data in updated_page_data.items():
         if "images" in data:
             data["images"] = deduplicate_images(data["images"])
+
     tasks = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for key, data in updated_page_data.items():
@@ -162,9 +174,11 @@ def process_images_and_update_page_data(pdf_path, output_folder, page_data):
                 for image in data["images"]:
                     image_file = image.get("file_path", "")
                     tasks.append((key, image, executor.submit(process_and_get_image_description, image_file)))
+
         for key, image, future in tasks:
             description = future.result()
             image["description"] = description
+
     total_images = sum(len(data.get("images", [])) for data in updated_page_data.values())
     return updated_page_data, total_images
 
@@ -194,15 +208,20 @@ def add_chunks_to_chromadb(collection, pdf_name, page_num, chunks):
         )
 
 def add_image_pointers_with_descriptions(page_texts, page_data):
+    """
+    Insert <IMAGE|filename|Desc: ...> markers into the text,
+    so the chunk later includes the image info.
+    """
     for page_key, data in page_data.items():
         try:
             page_num = int(page_key.split("_")[1])
-        except Exception:
+        except:
             continue
+
         images = data.get("images", [])
         for image in images:
             img_file_name = os.path.basename(image.get("file_path", ""))
-            desc_text = image.get("description", "").strip()
+            desc_text = (image.get("description") or "").strip()
             if desc_text:
                 marker = f"<IMAGE|{img_file_name}|Desc: {desc_text}>"
             else:
@@ -211,54 +230,63 @@ def add_image_pointers_with_descriptions(page_texts, page_data):
                 page_texts[page_num] += "\n" + marker
     return page_texts
 
-def save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data):
-    final_text = "\n--- Page ".join([f"{page} ---\n{text}" for page, text in page_texts.items()])
-    final_text_path = save_text_to_file(output_folder, pdf_name, final_text)
-    print(f"[Info] Cleaned text saved to: {final_text_path}")
-    metadata_json_path = save_metadata_to_json(metadata, page_data, output_folder, pdf_name)
-    print(f"[Info] Metadata saved to: {metadata_json_path}")
-    return final_text_path
-
-def extract_audio_and_update_page_data(pdf_path, output_folder, page_data):
-    audio_info = extract_audio(pdf_path, output_folder, page_data)
-    audio_count = sum(len(page.get("audios", [])) for page in page_data.values())
-    return page_data, audio_count
-
 def process_pdf(pdf_path, collection=None):
-    pdf_name, output_folder = setup_output_folder(pdf_path)
+    """
+    1) Extract text, images, audio, and tables from the PDF
+    2) Insert chunked text into the specified ChromaDB collection
+    3) All extracted content (images, etc.) goes into chat session folder
+    """
+    # Use the chat session folder from environment variables
+    session_folder = os.getenv("CHROMA_DB_DIR", "database/chat_unknown")
+    pdf_name, output_folder = setup_output_folder(pdf_path, session_folder)
+
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {}
-        print("[Step 2] Extracting text from PDF...")
+        print("[Step 2] Extracting text...")
         futures['text'] = executor.submit(extract_text, pdf_path)
-        print("[Step 3] Extracting metadata and links...")
+
+        print("[Step 3] Extracting metadata/links...")
         futures['metadata'] = executor.submit(extract_metadata_and_links_with_text, pdf_path)
+
         metadata, page_data = futures['metadata'].result()
         del futures['metadata']
-        print("[Step 4] Processing images and updating page data...")
+
+        print("[Step 4] Extracting & describing images...")
         futures['images'] = executor.submit(process_images_and_update_page_data, pdf_path, output_folder, page_data)
+
         print("[Step 5] Extracting tables...")
         futures['tables'] = executor.submit(extract_tables, pdf_path)
-        print("[Step 6] Extracting audio files...")
-        futures['audio'] = executor.submit(extract_audio_and_update_page_data, pdf_path, output_folder, page_data)
+
+        print("[Step 6] Extracting audio (annotations) ...")
+        futures['audio'] = executor.submit(extract_audio, pdf_path, output_folder, page_data)
+
         page_texts = futures['text'].result()
-        del futures['text']
         tables_with_metadata = futures['tables'].result()
-        del futures['tables']
         updated_page_data, image_count = futures['images'].result()
-        del futures['images']
-        page_data_audio, audio_count = futures['audio'].result()
-        del futures['audio']
+        audio_info = futures['audio'].result()
+
+        # Clean up references
+        del futures['text'], futures['tables'], futures['images'], futures['audio']
+
     page_data.update(updated_page_data)
-    page_data.update(page_data_audio)
+    page_data.update(audio_info)
+
+    # Insert table references
     page_data = update_page_data_with_tables(page_data, tables_with_metadata)
+    # Add image markers
     page_texts = add_image_pointers_with_descriptions(page_texts, page_data)
+    # Remove table text from the pages
     page_texts = remove_tables_from_text(page_texts, tables_with_metadata)
+    # Remove extraneous newlines
     page_texts = remove_excess_newlines(page_texts)
-    print("[Step 9] Saving extracted text and metadata to output files...")
-    final_text_path = save_final_text_and_metadata(pdf_name, output_folder, page_texts, metadata, page_data)
-    print(f"[Complete] PDF processing finished. Extracted {image_count} images and {audio_count} audio files.")
+
+    print(f"[Complete] Finished. Extracted {image_count} images.")
+
+    # Insert chunked text into Chroma if collection provided
     if collection:
         for page_num, text in page_texts.items():
             chunks = chunk_text_semantic(text, max_words=200)
             add_chunks_to_chromadb(collection, pdf_name, page_num, chunks)
-    return image_count, audio_count
+
+    # Return some metrics
+    return image_count, 0

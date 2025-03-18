@@ -7,3 +7,4 @@ CHROMA_DB_DIR = os.getenv("CHROMA_DB_DIR", "chromadb_storage")
 MAX_TEXT_LENGTH = 20000
 MODEL = "mistral"
 
+LEARNING_MODE = True

@@ -1,12 +1,10 @@
-# core/db_utils.py
-
 import os
 import re
 import json
 import chromadb
 from sentence_transformers import SentenceTransformer
 from datetime import datetime
-from core.config import CHROMA_DB_DIR, CHAT_HISTORY_FILE, SESSION_STATE_FILE, MAX_TEXT_LENGTH, MODEL
+from core.config import CHROMA_DB_DIR, CHAT_HISTORY_FILE, MAX_TEXT_LENGTH, MODEL
 
 client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
 query_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -15,7 +13,7 @@ active_collection = None
 active_collection_name = None
 chat_history = []
 
-# New globals for long-term memory
+# Global long-term memory summary.
 memory_summary = ""
 memory_included = False
 
@@ -39,38 +37,41 @@ def sanitize_collection_name(name: str) -> str:
     return name
 
 def load_session_state():
-    global active_collection, active_collection_name, chat_history
-    # Load chat history
+    """
+    Loads the chat history and long-term memory summary from CHAT_HISTORY_FILE.
+    Then, if active_collection_name is found, loads that collection from the DB.
+    Otherwise does not load any default collection.
+    """
+    global chat_history, memory_summary, active_collection, active_collection_name
     if os.path.exists(CHAT_HISTORY_FILE):
         try:
             with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
-                chat_history[:] = json.load(f)
-        except Exception as e:
-            print(f"[DB] Could not load chat history: {e}")
-    else:
-        chat_history[:] = []
-
-    if os.path.exists(SESSION_STATE_FILE):
-        try:
-            with open(SESSION_STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                last_collection = data.get("active_collection_name", None)
-                if last_collection:
-                    load_collection(last_collection)
+                chat_history[:] = data.get("chat_history", [])
+                memory_summary = data.get("memory_summary", "")
+                # If a prior session had an active collection, load it now
+                saved_coll = data.get("active_collection_name", None)
+                if saved_coll:
+                    load_collection(saved_coll)
         except Exception as e:
             print(f"[DB] Could not load session state: {e}")
+    else:
+        chat_history[:] = []
+        memory_summary = ""
 
 def save_session_state():
+    """
+    Saves the chat history, memory summary, and active_collection_name
+    into the same JSON file.
+    """
+    data = {
+        "chat_history": chat_history,
+        "memory_summary": memory_summary,
+        "active_collection_name": active_collection_name
+    }
     try:
         with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(chat_history, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[DB] Could not save chat history: {e}")
-
-    state_data = {"active_collection_name": active_collection_name}
-    try:
-        with open(SESSION_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state_data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"[DB] Could not save session state: {e}")
 
@@ -95,7 +96,6 @@ def auto_summarize_and_suggest():
         combined_text = " ".join(docs)
         if len(combined_text) > MAX_TEXT_LENGTH:
             combined_text = combined_text[:MAX_TEXT_LENGTH] + "...(truncated)..."
-
         summarization_prompt = (
             f"You are an AI assistant.\n\n"
             f"Here is the text from a newly ingested PDF (collection: {active_collection_name}):\n\n"
@@ -118,13 +118,13 @@ def normal_ollama_chat(user_input: str) -> str:
     import ollama
     global memory_included, memory_summary
     if memory_summary and not memory_included:
-         prompt = (
-             f"You are an AI assistant. Here is your long-term memory from previous conversations:\n{memory_summary}\n\n"
-             f"User: {user_input}\n\nAssistant:"
-         )
-         memory_included = True
+        prompt = (
+            f"You are an AI assistant. Here is your long-term memory from previous conversations:\n{memory_summary}\n\n"
+            f"User: {user_input}\n\nAssistant:"
+        )
+        memory_included = True
     else:
-         prompt = f"You are an AI assistant.\n\nUser: {user_input}\n\nAssistant:"
+        prompt = f"You are an AI assistant.\n\nUser: {user_input}\n\nAssistant:"
     try:
         out = ollama.generate(model=MODEL, prompt=prompt)
         response_text = out.get("response", "No response")
@@ -134,10 +134,14 @@ def normal_ollama_chat(user_input: str) -> str:
         return f"(Error in normal Ollama chat) {e}"
 
 def rag_ollama_chat(user_input: str) -> str:
+    """
+    If there's an active collection, use it for retrieval-augmented generation.
+    Otherwise, fall back to normal chat logic.
+    """
     if not active_collection:
         return normal_ollama_chat(user_input)
-    qembed = embed_query(user_input)
     import ollama
+    qembed = embed_query(user_input)
     try:
         results = active_collection.query(
             query_embeddings=[qembed],
@@ -165,45 +169,29 @@ def rag_ollama_chat(user_input: str) -> str:
     except Exception as e:
         return f"(Error generating RAG answer) {e}"
 
-def get_session_folder():
-    return os.path.dirname(os.getenv("CHAT_HISTORY_FILE", os.getcwd()))
-
-def load_memory_summary():
-    global memory_summary
-    mem_file = os.path.join(get_session_folder(), "memory_summary.txt")
-    if os.path.exists(mem_file):
-        try:
-            with open(mem_file, "r", encoding="utf-8") as f:
-                memory_summary = f.read().strip()
-        except Exception as e:
-            print(f"[DB] Error loading memory summary: {e}")
-    return memory_summary
-
-def save_memory_summary():
-    mem_file = os.path.join(get_session_folder(), "memory_summary.txt")
-    try:
-        with open(mem_file, "w", encoding="utf-8") as f:
-            f.write(memory_summary)
-    except Exception as e:
-        print(f"[DB] Could not save memory summary: {e}")
-
+# ----- Long-term Memory Functions -----
 def update_memory_summary(new_messages):
+    """
+    Appends a detailed summary of the last 10 messages to the existing memory summary.
+    """
     global memory_summary
     new_text = build_chunk_text(new_messages)
     prompt = (
         "You are an AI assistant maintaining a long-term memory of a conversation. "
-        "You already have an existing memory summary (which compresses older parts) and now you have new conversation turns.\n\n"
-        f"Existing Memory Summary:\n{memory_summary if memory_summary else '[None]'}\n\n"
-        f"New Conversation Turns:\n{new_text}\n\n"
-        "Update the memory summary so that older parts are very brief and the new parts are described in detail. "
-        "Output only the updated memory summary."
+        "You already have an existing conversation summary that covers older details. "
+        "Now, here are the last 10 conversation turns that need to be kept detailed:\n\n"
+        f"Existing Conversation Summary:\n{memory_summary if memory_summary else '[None]'}\n\n"
+        f"Last 10 Conversation Turns (detailed):\n{new_text}\n\n"
+        "Merge these into an updated conversation summary that retains all key details, "
+        "with the older parts compressed and the last 10 turns described in detail. "
+        "Output only the updated conversation summary."
     )
     import ollama
     try:
         resp = ollama.generate(model=MODEL, prompt=prompt)
         updated = resp.get("response", "[No memory update]")
         memory_summary = updated.strip()
-        save_memory_summary()
+        save_session_state()
         print("[DB] Memory summary updated.")
     except Exception as e:
         print(f"[DB] Error updating memory summary: {e}")
