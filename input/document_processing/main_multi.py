@@ -130,6 +130,7 @@ def process_and_get_image_description(image_file):
     Calls ollama_images.process_image(image_file) to generate a description
     but does not rely on reading/writing separate .txt. Instead returns the text.
     """
+
     try:
         from image_processing import ollama_images
         desc = ollama_images.process_image(image_file)
@@ -171,6 +172,7 @@ def process_images_and_update_page_data(pdf_path, output_folder, page_data):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for key, data in updated_page_data.items():
             if "images" in data:
+                print("[Step 6] Processing images...")
                 for image in data["images"]:
                     image_file = image.get("file_path", "")
                     tasks.append((key, image, executor.submit(process_and_get_image_description, image_file)))
@@ -242,22 +244,22 @@ def process_pdf(pdf_path, collection=None):
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {}
-        print("[Step 2] Extracting text...")
+        print("[Step 1] Extracting text...")
         futures['text'] = executor.submit(extract_text, pdf_path)
 
-        print("[Step 3] Extracting metadata/links...")
+        print("[Step 2] Extracting metadata/links...")
         futures['metadata'] = executor.submit(extract_metadata_and_links_with_text, pdf_path)
 
         metadata, page_data = futures['metadata'].result()
         del futures['metadata']
 
-        print("[Step 4] Extracting & describing images...")
+        print("[Step 3] Extracting & describing images...")
         futures['images'] = executor.submit(process_images_and_update_page_data, pdf_path, output_folder, page_data)
 
-        print("[Step 5] Extracting tables...")
+        print("[Step 4] Extracting tables...")
         futures['tables'] = executor.submit(extract_tables, pdf_path)
 
-        print("[Step 6] Extracting audio (annotations) ...")
+        print("[Step 5] Extracting audio ...")
         futures['audio'] = executor.submit(extract_audio, pdf_path, output_folder, page_data)
 
         page_texts = futures['text'].result()

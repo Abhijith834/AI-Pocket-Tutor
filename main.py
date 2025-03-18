@@ -59,6 +59,8 @@ if is_new_session and learning_mode_chosen and config.LEARNING_MODE:
     agent.init_learning_mode()
     final_pdf_path = agent.final_pdf_path
 
+
+
 print("\n[Main] Switching to normal chat mode.\n")
 
 if __name__ == "__main__":
