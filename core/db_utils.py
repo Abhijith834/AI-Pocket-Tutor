@@ -38,18 +38,17 @@ def sanitize_collection_name(name: str) -> str:
 
 def load_session_state():
     """
-    Loads the chat history and long-term memory summary from CHAT_HISTORY_FILE.
+    Loads the chat history, long-term memory summary, and recent summary from CHAT_HISTORY_FILE.
     Then, if active_collection_name is found, loads that collection from the DB.
-    Otherwise does not load any default collection.
     """
-    global chat_history, memory_summary, active_collection, active_collection_name
+    global chat_history, memory_summary, recent_summary, active_collection, active_collection_name
     if os.path.exists(CHAT_HISTORY_FILE):
         try:
             with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 chat_history[:] = data.get("chat_history", [])
                 memory_summary = data.get("memory_summary", "")
-                # If a prior session had an active collection, load it now
+                recent_summary = data.get("recent_summary", "")
                 saved_coll = data.get("active_collection_name", None)
                 if saved_coll:
                     load_collection(saved_coll)
@@ -58,15 +57,21 @@ def load_session_state():
     else:
         chat_history[:] = []
         memory_summary = ""
+        recent_summary = ""
+
+
+# Add a new global variable for recent summary
+recent_summary = ""
 
 def save_session_state():
     """
-    Saves the chat history, memory summary, and active_collection_name
+    Saves the chat history, memory summary, recent summary, and active_collection_name
     into the same JSON file.
     """
     data = {
         "chat_history": chat_history,
         "memory_summary": memory_summary,
+        "recent_summary": recent_summary,
         "active_collection_name": active_collection_name
     }
     try:
@@ -74,6 +79,11 @@ def save_session_state():
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"[DB] Could not save session state: {e}")
+
+def set_recent_summary(summary):
+    global recent_summary
+    recent_summary = summary
+
 
 def load_collection(collection_name: str):
     global active_collection, active_collection_name

@@ -5,7 +5,8 @@ import ollama
 import re
 import sys
 import time
-
+import threading
+import queue
 import core.config as config
 import core.db_utils as db_utils
 from core.config import CHAT_HISTORY_FILE
@@ -28,8 +29,29 @@ unsummarized_messages = []
 MEMORY_UPDATE_THRESHOLD = 10
 messages_since_summary = 0
 last_input_time = time.time()
+next_chat_session = None
 
 
+def input_with_timeout(prompt, timeout):
+    """Waits for user input for 'timeout' seconds. Raises TimeoutError if no input is provided."""
+    result = queue.Queue()
+
+    def get_input():
+        try:
+            user_input = input(prompt)
+            result.put(user_input)
+        except Exception:
+            result.put("")
+    
+    thread = threading.Thread(target=get_input)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        return result.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError
+    
 def build_chunk_text(messages):
     lines = []
     for msg in messages:
@@ -55,11 +77,12 @@ def do_incremental_summary(text_chunk: str) -> str:
 def summarize_if_needed():
     global messages_since_summary
     if messages_since_summary >= SUMMARIZE_THRESHOLD:
-        chunk_to_summarize = db_utils.chat_history[:SUMMARIZE_THRESHOLD]
+        # Take the last SUMMARIZE_THRESHOLD messages for summarization
+        chunk_to_summarize = db_utils.chat_history[-SUMMARIZE_THRESHOLD:]
         text_chunk = build_chunk_text(chunk_to_summarize)
         summary_text = do_incremental_summary(text_chunk)
-        db_utils.chat_history = db_utils.chat_history[SUMMARIZE_THRESHOLD:]
-        db_utils.chat_history.append({"role": "assistant", "content": summary_text})
+        # Update the memory summary with the detailed summary of these messages
+        db_utils.update_memory_summary([{"role": "assistant", "content": summary_text}])
         db_utils.save_session_state()
         messages_since_summary = 0
 
@@ -68,12 +91,18 @@ def finalize_leftover_messages():
         db_utils.update_memory_summary(unsummarized_messages)
         unsummarized_messages.clear()
     if db_utils.chat_history:
-        text_chunk = build_chunk_text(db_utils.chat_history)
-        summary_text = do_incremental_summary(text_chunk)
-        db_utils.chat_history[:] = []
-        db_utils.chat_history.append({"role": "assistant", "content": summary_text})
+        # Generate recent summary from the last 10 messages (or fewer if not available)
+        recent_chunk = db_utils.chat_history[-10:] if len(db_utils.chat_history) >= 10 else db_utils.chat_history[:]
+        recent_text_chunk = build_chunk_text(recent_chunk)
+        recent_summary = do_incremental_summary(recent_text_chunk)
+        # Update the recent summary in the session state (outside chat_history)
+        db_utils.set_recent_summary(recent_summary)
         db_utils.save_session_state()
-    print("[System] Final summary complete. Exiting now.")
+    print("[System] Final summaries updated. Exiting now.")
+
+
+
+
 
 def validate_answer(answer: str, user_query: str) -> bool:
     validation_prompt = (
@@ -225,30 +254,42 @@ def main(final_pdf_path=None):
 
     # ------------- Now the normal chat loop -------------
     while True:
-        if time.time() - last_input_time > INACTIVITY_TIMEOUT:
+        remaining = INACTIVITY_TIMEOUT - (time.time() - last_input_time)
+        if remaining <= 0:
             print("[System] Inactivity timeout reached. Finalizing conversation and exiting.")
             finalize_leftover_messages()
-            sys.exit(0)
-
+            return next_chat_session
         try:
-            user_input = input("USER:\n").strip()
+            # Use input_with_timeout with the remaining time as timeout
+            user_input = input_with_timeout("USER:\n", timeout=remaining).strip()
+        except TimeoutError:
+            print("[System] Inactivity timeout reached. Finalizing conversation and exiting.")
+            finalize_leftover_messages()
+            return next_chat_session
         except EOFError:
             print("[System] EOF detected. Finalizing conversation and exiting.")
             finalize_leftover_messages()
-            sys.exit(0)
+            return next_chat_session
         except Exception as e:
             print(f"[System] Error reading input: {e}. Finalizing conversation and exiting.")
             finalize_leftover_messages()
-            sys.exit(0)
+            return next_chat_session
 
-        last_input_time = time.time()
+        last_input_time = time.time()  # Update last input time after successful input
         if not user_input:
             continue
         if user_input.lower() == "exit":
             print("[System] Exit command received. Finalizing conversation.")
             finalize_leftover_messages()
-            print("Exiting. Goodbye!")
-            sys.exit(0)
+            return next_chat_session
+        
+        chat_match = re.match(r'^\s*chat\s*\(\s*(\d+)\s*\)\s*$', user_input.lower())
+        if chat_match:
+            new_session_id = chat_match.group(1)
+            print(f"[System] Jumping to chat session {new_session_id} now.")
+            finalize_leftover_messages()
+            next_chat_session = new_session_id
+            return next_chat_session
 
         # If user typed file(...) command in normal chat
         if user_input.lower().startswith("file"):
