@@ -21,16 +21,14 @@ from core.web_search import (
 )
 import sys_msgs
 
-# Global variables for summarization and memory update
+next_chat_session = None
+
 SUMMARIZE_THRESHOLD = 10
 INACTIVITY_TIMEOUT = 5 * 60
-
 unsummarized_messages = []
 MEMORY_UPDATE_THRESHOLD = 10
 messages_since_summary = 0
 last_input_time = time.time()
-next_chat_session = None
-
 
 def input_with_timeout(prompt, timeout):
     """Waits for user input for 'timeout' seconds. Raises TimeoutError if no input is provided."""
@@ -100,10 +98,6 @@ def finalize_leftover_messages():
         db_utils.save_session_state()
     print("[System] Final summaries updated. Exiting now.")
 
-
-
-
-
 def validate_answer(answer: str, user_query: str) -> bool:
     validation_prompt = (
         f"User Query: {user_query}\n"
@@ -155,7 +149,7 @@ def should_search() -> bool:
     response = ollama.chat(
         model=config.MODEL,
         messages=[
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": sys_msgs.search_or_not_msg},
             user_message
         ]
     )
@@ -163,7 +157,6 @@ def should_search() -> bool:
     content = db_utils.remove_think_clauses(raw_content).strip().lower()
     print(f"[search_or_not] LLM response: '{content}'")
     return content == "true"
-
 
 #
 # --------------------- NEW HELPER FUNCTION ---------------------
@@ -208,7 +201,7 @@ def main(final_pdf_path=None):
     The main chat loop. If final_pdf_path is provided, we wait until after the
     normal chat interface is shown, then ingest that PDF automatically.
     """
-    global messages_since_summary, last_input_time
+    global messages_since_summary, last_input_time, next_chat_session
     last_input_time = time.time()
 
     # Attempt to load chat history (if not already loaded by main.py)
@@ -236,7 +229,6 @@ def main(final_pdf_path=None):
         print("[Chat] Learning mode provided a PDF. Ingesting now...\n")
         # Exactly as if user typed: file (the/path)
         user_cmd = f"file ({final_pdf_path})"
-        # We do the same steps as if user typed it in the loop:
         db_utils.chat_history.append({"role": "user", "content": user_cmd})
         unsummarized_messages.append({"role": "user", "content": user_cmd})
         db_utils.save_session_state()
@@ -259,6 +251,7 @@ def main(final_pdf_path=None):
             print("[System] Inactivity timeout reached. Finalizing conversation and exiting.")
             finalize_leftover_messages()
             return next_chat_session
+
         try:
             # Use input_with_timeout with the remaining time as timeout
             user_input = input_with_timeout("USER:\n", timeout=remaining).strip()
@@ -282,6 +275,17 @@ def main(final_pdf_path=None):
             print("[System] Exit command received. Finalizing conversation.")
             finalize_leftover_messages()
             return next_chat_session
+                # If user typed new chat(...) command in normal chat
+        if user_input.lower() in ["new chat(normal)", "new chat (normal)"]:
+            print("[System] Creating a new NORMAL chat session now.")
+            finalize_leftover_messages()
+            return "NEWCHAT:normal"
+
+        if user_input.lower() in ["new chat(learning)", "new chat (learning)"]:
+            print("[System] Creating a new LEARNING chat session now.")
+            finalize_leftover_messages()
+            return "NEWCHAT:learning"
+
         
         chat_match = re.match(r'^\s*chat\s*\(\s*(\d+)\s*\)\s*$', user_input.lower())
         if chat_match:
