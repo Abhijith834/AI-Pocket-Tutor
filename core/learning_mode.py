@@ -1,17 +1,3 @@
-"""
-Module: learning_mode.py
-
-When a new learning-mode session starts, the user can either:
-1) Provide a local file via 'file (C:\path)', or
-2) Specify a subject to perform a PDF search via the Googlesearch library.
-
-Any downloaded PDF is saved in the current chat session folder under a "pdf" subfolder.
-For example, if the session is "chat_7", the PDF is stored in:
-    chat_7/pdf/filename.pdf
-
-Once the PDF path is determined, it is stored in final_pdf_path, but not ingested here.
-"""
-
 import os
 import requests
 from googlesearch import search
@@ -98,26 +84,33 @@ class LearningModeAgent:
 
     def download_pdf(self, url: str):
         """
-        Downloads the PDF from the given URL, disabling SSL verification to avoid certificate issues.
-        The PDF is saved in the current chat's session folder under "pdf/filename.pdf".
+        Downloads the PDF from the given URL, adding a browser-like user-agent header to bypass potential 403 errors.
+        The PDF is saved in the current chat session folder under a "pdf" subfolder.
         """
         print(f"[LearningMode] Downloading: {url}")
 
-        # 1) Determine the chat folder from environment
+        # 1) Determine the chat folder from environment variables.
         session_id = os.environ.get("SESSION_ID", "unknown")
         chat_history_file = os.environ.get("CHAT_HISTORY_FILE", "chat_history.json")
         session_folder = os.path.dirname(os.path.abspath(chat_history_file))
 
-        # 2) Create a "pdf" subfolder inside this session folder
+        # 2) Create a "pdf" subfolder inside this session folder.
         pdf_folder = os.path.join(session_folder, "pdf")
         os.makedirs(pdf_folder, exist_ok=True)
 
+        # Set headers with a browser-like user agent.
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/58.0.3029.110 Safari/537.3"
+        }
+
         try:
-            # Make the request (disable SSL verify as needed)
-            resp = requests.get(url, timeout=15, verify=False)
+            # Make the request with headers, a timeout, and SSL verification disabled.
+            resp = requests.get(url, timeout=15, verify=False, headers=headers)
             resp.raise_for_status()
 
-            # Extract filename from URL
+            # Extract filename from URL.
             fname = url.split("/")[-1]
             if not fname.endswith(".pdf"):
                 fname = "document.pdf"

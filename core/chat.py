@@ -7,6 +7,7 @@ import sys
 import time
 import threading
 import queue
+import requests  # NEW: We'll poll the front-end messages
 import core.config as config
 import core.db_utils as db_utils
 from core.config import CHAT_HISTORY_FILE
@@ -24,14 +25,27 @@ import sys_msgs
 next_chat_session = None
 
 SUMMARIZE_THRESHOLD = 10
-INACTIVITY_TIMEOUT = 5 * 60
+INACTIVITY_TIMEOUT = 15 * 60
 unsummarized_messages = []
 MEMORY_UPDATE_THRESHOLD = 10
 messages_since_summary = 0
 last_input_time = time.time()
+last_processed_timestamp = None
+
+# NEW: Keep track of how many front-end messages we've seen so far
+last_front_end_count = 0
 
 def input_with_timeout(prompt, timeout):
-    """Waits for user input for 'timeout' seconds. Raises TimeoutError if no input is provided."""
+    """
+    Waits for user input OR new front-end message for 'timeout' seconds.
+    1) If console input arrives first, return it.
+    2) If a new front-end message arrives first, return it.
+    3) If neither arrives within 'timeout', raise TimeoutError.
+    """
+    # We'll do short polling in a loop, up to 'timeout' seconds.
+    start_time = time.time()
+
+    # Create a queue for console input (as before)
     result = queue.Queue()
 
     def get_input():
@@ -40,16 +54,83 @@ def input_with_timeout(prompt, timeout):
             result.put(user_input)
         except Exception:
             result.put("")
-    
-    thread = threading.Thread(target=get_input)
-    thread.daemon = True
+
+    thread = threading.Thread(target=get_input, daemon=True)
     thread.start()
 
+    # Define both endpoints
+    front_end_url_ngrok = "https://mint-jackal-publicly.ngrok-free.app/api/cli-messages"
+    front_end_url_local = "http://localhost:5000/api/cli-messages"
+    # Header required for ngrok
+    ngrok_headers = {"ngrok-skip-browser-warning": "true"}
+
+    global last_processed_timestamp
+
+    # Clear old messages by doing an initial GET and updating last_processed_timestamp.
     try:
-        return result.get(timeout=timeout)
-    except queue.Empty:
-        raise TimeoutError
-    
+        try:
+            resp = requests.get(front_end_url_ngrok, headers=ngrok_headers, timeout=2)
+            if resp.status_code != 200:
+                raise Exception(f"Ngrok response status: {resp.status_code}")
+            print("Initial fetch using ngrok URL for cli-messages")
+        except Exception as e:
+            print("Initial ngrok fetch failed, falling back to localhost:5000:", e)
+            resp = requests.get(front_end_url_local, timeout=2)
+        if resp.status_code == 200:
+            data = resp.json()
+            messages = data.get("received_messages", [])
+            if messages and len(messages) > 0:
+                # Set last_processed_timestamp to the latest message's timestamp
+                last_processed_timestamp = messages[-1].get("timestamp")
+                print("Clearing old messages. Last processed timestamp set to:", last_processed_timestamp)
+            else:
+                last_processed_timestamp = None
+        else:
+            last_processed_timestamp = None
+    except Exception as e:
+        print("Initial polling error:", e)
+        last_processed_timestamp = None
+
+    while True:
+        # 1) Check if console input is available
+        if not result.empty():
+            return result.get()
+
+        # 2) Check if we've exceeded the timeout
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            raise TimeoutError
+
+        # 3) Poll for new front-end messages using fallback
+        try:
+            try:
+                # Attempt to use the ngrok URL first.
+                resp = requests.get(front_end_url_ngrok, headers=ngrok_headers, timeout=2)
+                if resp.status_code != 200:
+                    raise Exception(f"Ngrok response status: {resp.status_code}")
+                print("Using ngrok URL for cli-messages")
+            except Exception as e:
+                print("Ngrok fetch failed, falling back to localhost:5000:", e)
+                resp = requests.get(front_end_url_local, timeout=2)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                messages = data.get("received_messages", [])
+                if messages and len(messages) > 0:
+                    # Get the latest message (assumed to be last in the list)
+                    latest_msg = messages[-1]
+                    # Check if the latest message has a timestamp and if it's new
+                    if latest_msg.get("timestamp") and latest_msg.get("timestamp") != last_processed_timestamp:
+                        last_processed_timestamp = latest_msg.get("timestamp")
+                        return latest_msg
+            # If no new message, continue.
+        except Exception as e:
+            print("Polling error:", e)
+
+        # 4) Short sleep before next check
+        time.sleep(0.2)
+
+
 def build_chunk_text(messages):
     lines = []
     for msg in messages:
@@ -75,11 +156,9 @@ def do_incremental_summary(text_chunk: str) -> str:
 def summarize_if_needed():
     global messages_since_summary
     if messages_since_summary >= SUMMARIZE_THRESHOLD:
-        # Take the last SUMMARIZE_THRESHOLD messages for summarization
         chunk_to_summarize = db_utils.chat_history[-SUMMARIZE_THRESHOLD:]
         text_chunk = build_chunk_text(chunk_to_summarize)
         summary_text = do_incremental_summary(text_chunk)
-        # Update the memory summary with the detailed summary of these messages
         db_utils.update_memory_summary([{"role": "assistant", "content": summary_text}])
         db_utils.save_session_state()
         messages_since_summary = 0
@@ -89,11 +168,9 @@ def finalize_leftover_messages():
         db_utils.update_memory_summary(unsummarized_messages)
         unsummarized_messages.clear()
     if db_utils.chat_history:
-        # Generate recent summary from the last 10 messages (or fewer if not available)
         recent_chunk = db_utils.chat_history[-10:] if len(db_utils.chat_history) >= 10 else db_utils.chat_history[:]
         recent_text_chunk = build_chunk_text(recent_chunk)
         recent_summary = do_incremental_summary(recent_text_chunk)
-        # Update the recent summary in the session state (outside chat_history)
         db_utils.set_recent_summary(recent_summary)
         db_utils.save_session_state()
     print("[System] Final summaries updated. Exiting now.")
@@ -120,28 +197,21 @@ def validate_answer(answer: str, user_query: str) -> bool:
 def master_answer_flow(user_input: str) -> str:
     if db_utils.active_collection:
         db_ans = db_utils.rag_ollama_chat(user_input)
-        # Optionally validate
         if db_ans and not db_ans.lower().startswith("i couldn't find relevant info"):
             if validate_answer(db_ans, user_input):
                 return "[source: document]\n" + db_ans
 
-    # If no active collection or doc-based answer not found:
-    # Optionally check if we need external search
     if should_search():
         web_ans = web_search_flow(user_input)
         if web_ans.strip():
             return "[source: web]\nI retrieved external information:\n\n" + web_ans
 
-    # Otherwise fallback to internal
     internal_ans = db_utils.normal_ollama_chat(user_input)
     if validate_answer(internal_ans, user_input):
         return "[source: internal]\n" + internal_ans
     return "[source: internal]\n" + internal_ans
 
 def should_search() -> bool:
-    """
-    Asks the LLM if external data is needed based on the last user message.
-    """
     if not db_utils.chat_history:
         return False
     user_message = db_utils.chat_history[-1]
@@ -158,15 +228,7 @@ def should_search() -> bool:
     print(f"[search_or_not] LLM response: '{content}'")
     return content == "true"
 
-#
-# --------------------- NEW HELPER FUNCTION ---------------------
-#
 def process_injected_file_command():
-    """
-    Checks if the last user message in chat_history is a 'file(...)' command.
-    If so, run the ingestion pipeline and set the active collection immediately.
-    This ensures that when normal chat starts, the doc is already loaded.
-    """
     global messages_since_summary
 
     if not db_utils.chat_history:
@@ -197,14 +259,9 @@ def process_injected_file_command():
                 db_utils.auto_summarize_and_suggest()
 
 def main(final_pdf_path=None):
-    """
-    The main chat loop. If final_pdf_path is provided, we wait until after the
-    normal chat interface is shown, then ingest that PDF automatically.
-    """
     global messages_since_summary, last_input_time, next_chat_session
     last_input_time = time.time()
 
-    # Attempt to load chat history (if not already loaded by main.py)
     if os.path.exists(CHAT_HISTORY_FILE):
         try:
             with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -215,7 +272,6 @@ def main(final_pdf_path=None):
     else:
         db_utils.chat_history[:] = []
 
-    # If there's an active collection, we show it; otherwise, say none.
     if db_utils.active_collection_name:
         print(f"[Chat] Active collection loaded: {db_utils.active_collection_name}")
     else:
@@ -224,10 +280,8 @@ def main(final_pdf_path=None):
     print("\nType your message to chat. For PDF ingestion, type: file (C:\\path\\to.pdf).")
     print("Type 'exit' to quit.\n")
 
-    # ----------- LATE INGEST of final_pdf_path -----------
     if final_pdf_path:
         print("[Chat] Learning mode provided a PDF. Ingesting now...\n")
-        # Exactly as if user typed: file (the/path)
         user_cmd = f"file ({final_pdf_path})"
         db_utils.chat_history.append({"role": "user", "content": user_cmd})
         unsummarized_messages.append({"role": "user", "content": user_cmd})
@@ -244,7 +298,6 @@ def main(final_pdf_path=None):
         if db_utils.active_collection:
             db_utils.auto_summarize_and_suggest()
 
-    # ------------- Now the normal chat loop -------------
     while True:
         remaining = INACTIVITY_TIMEOUT - (time.time() - last_input_time)
         if remaining <= 0:
@@ -253,8 +306,11 @@ def main(final_pdf_path=None):
             return next_chat_session
 
         try:
-            # Use input_with_timeout with the remaining time as timeout
-            user_input = input_with_timeout("USER:\n", timeout=remaining).strip()
+            received = input_with_timeout("USER:\n", timeout=remaining)
+            if isinstance(received, dict):
+                user_input = received.get("message", "")
+            else:
+                user_input = received.strip()
         except TimeoutError:
             print("[System] Inactivity timeout reached. Finalizing conversation and exiting.")
             finalize_leftover_messages()
@@ -268,14 +324,15 @@ def main(final_pdf_path=None):
             finalize_leftover_messages()
             return next_chat_session
 
-        last_input_time = time.time()  # Update last input time after successful input
+        last_input_time = time.time()
+
         if not user_input:
             continue
         if user_input.lower() == "exit":
             print("[System] Exit command received. Finalizing conversation.")
             finalize_leftover_messages()
             return next_chat_session
-                # If user typed new chat(...) command in normal chat
+
         if user_input.lower() in ["new chat(normal)", "new chat (normal)"]:
             print("[System] Creating a new NORMAL chat session now.")
             finalize_leftover_messages()
@@ -286,7 +343,6 @@ def main(final_pdf_path=None):
             finalize_leftover_messages()
             return "NEWCHAT:learning"
 
-        
         chat_match = re.match(r'^\s*chat\s*\(\s*(\d+)\s*\)\s*$', user_input.lower())
         if chat_match:
             new_session_id = chat_match.group(1)
@@ -295,7 +351,6 @@ def main(final_pdf_path=None):
             next_chat_session = new_session_id
             return next_chat_session
 
-        # If user typed file(...) command in normal chat
         if user_input.lower().startswith("file"):
             start = user_input.find("(")
             end = user_input.find(")")
@@ -323,7 +378,6 @@ def main(final_pdf_path=None):
                 print("Please specify file path in parentheses: file (C:\\path\\to\\doc.pdf)")
                 continue
 
-        # Normal user query
         db_utils.chat_history.append({"role": "user", "content": user_input})
         unsummarized_messages.append({"role": "user", "content": user_input})
         db_utils.save_session_state()
@@ -338,7 +392,6 @@ def main(final_pdf_path=None):
         messages_since_summary += 1
         summarize_if_needed()
 
-        # Memory update if needed
         if len(unsummarized_messages) >= MEMORY_UPDATE_THRESHOLD:
             db_utils.update_memory_summary(unsummarized_messages)
             unsummarized_messages.clear()
