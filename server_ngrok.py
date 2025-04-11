@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-
+import urllib.parse
 from core import db_utils, chat, config
 from core.learning_mode import LearningModeAgent
 
@@ -257,6 +257,121 @@ def get_database_file():
         except Exception as e:
             return jsonify({"error": f"Could not send file: {str(e)}"}), 500
 
+@app.route("/api/database/pdf", methods=["GET"])
+def get_database_pdf():
+    try:
+        session_id = request.args.get("session")
+        rel_path = request.args.get("filepath")
+
+        if not session_id or not rel_path:
+            return jsonify({"error": "Missing 'session' or 'filepath' parameter"}), 400
+
+        # ROOT_DIR points to C:\Users\abhij\Desktop\AI Pocket Tutor\AI-Pocket-Tutor
+        ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+        # Use the correct path — DO NOT add "AI-Pocket-Tutor" again
+        base_path = os.path.join(ROOT_DIR, "database", f"chat_{session_id}")
+        abs_path = os.path.normpath(os.path.join(base_path, rel_path))
+
+        print(f"[Server] Trying to serve file: {abs_path}")
+
+        if not os.path.isfile(abs_path):
+            return jsonify({"error": f"File not found at: {abs_path}"}), 404
+
+        return send_file(abs_path, as_attachment=False)
+
+    except Exception as e:
+        return jsonify({"error": f"Could not send file: {str(e)}"}), 500
+    
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+@app.route("/api/transcribe", methods=["POST"])
+def receive_audio():
+    # Get the audio file and session_id from the request.
+    audio_file = request.files.get("audio")
+    session_id = request.form.get("session_id")
+
+    if not audio_file or not session_id:
+        return jsonify({"status": "error", "message": "Missing audio or session_id"}), 400
+
+    # Set up the session folder and "stt" subfolder.
+    folder_path = os.path.join(BASE_DIR, f"chat_{session_id}", "stt")
+    os.makedirs(folder_path, exist_ok=True)
+
+    # Save the audio file.
+    file_path = os.path.join(folder_path, audio_file.filename)
+    audio_file.save(file_path)
+
+    # Form the public URL for the saved file.
+    public_url = f"http://localhost:5000/api/database/chat_{session_id}/stt/{audio_file.filename}"
+
+    return jsonify({"status": "saved", "path": file_path, "url": public_url}), 200
+
+@app.route("/api/tts/<session>", methods=["POST"])
+def receive_tts_audio(session):
+    """
+    Receives a TTS-generated audio file.
+    Expects:
+      - A file (form key "file")
+      - A form field "filename", e.g. "chat_10#12.wav"
+    Saves the file under:
+      BASE_DIR/database/<session>/tts/<filename>
+    Returns a public URL for retrieval.
+    """
+    uploaded_file = request.files.get("file")
+    filename = request.form.get("filename")
+    
+    if not uploaded_file or not filename:
+        return jsonify({"status": "error", "message": "Missing file or filename"}), 400
+
+    # Build destination folder, e.g.
+    # .../AI-Pocket-Tutor/database/chat_10/tts/
+    dest_folder = os.path.join(BASE_DIR, "database", session, "tts")
+    os.makedirs(dest_folder, exist_ok=True)
+    
+    dest_path = os.path.join(dest_folder, filename)
+    try:
+        uploaded_file.save(dest_path)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error saving file: {e}"}), 500
+
+    # URL-encode the filename so reserved characters are escaped (e.g. '#' becomes '%23')
+    encoded_filename = urllib.parse.quote(filename)
+    public_url = f"http://localhost:5000/api/tts/{session}/{encoded_filename}"
+    return jsonify({"status": "saved", "path": dest_path, "url": public_url}), 200
+
+@app.route("/api/tts/<session>/<filename>", methods=["GET"])
+def serve_tts_audio(session, filename):
+    """
+    Serves the audio file from:
+      BASE_DIR/database/<session>/tts/<filename>
+    Logs the computed file path for debugging.
+    """
+    file_path = os.path.join(BASE_DIR, "database", session, "tts", filename)
+    print(f"GET Request for session: {session}, filename: {filename}")
+    print(f"Computed file path: {file_path}")
+    if not os.path.exists(file_path):
+        print(f"File not found at: {file_path}")
+        return jsonify({"status": "error", "message": "File not found"}), 404
+    return send_file(file_path, mimetype="audio/wav", as_attachment=False)
+    
+@app.route("/api/database/session-state", methods=["GET"])
+def get_session_state():
+    try:
+        # ROOT_DIR = where this script lives
+        ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(ROOT_DIR, "database", "session_state.json")
+
+        print(f"[Server] Trying to serve session state: {file_path}")
+
+        if not os.path.isfile(file_path):
+            return jsonify({"error": f"session_state.json not found at: {file_path}"}), 404
+
+        return send_file(file_path, as_attachment=False)
+
+    except Exception as e:
+        return jsonify({"error": f"Could not load session state: {str(e)}"}), 500
+
 @app.route("/api/ai-pocket-tutor/database/folders", methods=["GET"])
 def list_ai_pocket_tutor_database_folders():
     try:
@@ -286,7 +401,23 @@ def clear_db_notifications():
     db_notifications = []
     return jsonify({"message": "Notifications cleared"}), 200
 
-# NEW: Global dictionary to store front-end messages.
+@app.route("/api/upload", methods=["POST"])
+def upload_file():
+    if "file" not in request.files or "session_id" not in request.form:
+        return jsonify({"error": "Missing file or session ID"}), 400
+
+    file = request.files["file"]
+    session_id = request.form["session_id"]
+
+    base_folder = os.path.join(DATABASE_ROOT, f"chat_{session_id}", "pdf")
+    os.makedirs(base_folder, exist_ok=True)  # Ensure the pdf subfolder exists
+
+    save_path = os.path.join(base_folder, file.filename)
+    file.save(save_path)
+
+    print(f"[Upload] File saved to: {os.path.abspath(save_path)}")
+    return jsonify({"message": "File uploaded successfully", "path": save_path}), 200
+
 received_messages_by_session = {}
 
 @app.route("/api/cli-messages", methods=["GET"])

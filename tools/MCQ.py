@@ -60,21 +60,10 @@ def load_all_collections(session_id: str):
 def load_specific_collection(session_id: str, topic: str):
     """
     Load a specific collection (topic) from the session.
+    (Not used since there is only one collection.)
     """
-    tools_dir = os.path.abspath(os.path.dirname(__file__))
-    database_root = os.path.join(tools_dir, "..", "database")
-    session_folder = os.path.join(database_root, f"chat_{session_id}")
-    chroma_db_dir = os.path.join(session_folder, "chromadb_storage")
-    
-    if not os.path.isdir(chroma_db_dir):
-        sys.exit(f"[MCQ] Error: No chromadb_storage found for session {session_id}.")
-    
-    client = chromadb.PersistentClient(path=chroma_db_dir)
-    coll_names = client.list_collections()
-    if topic not in coll_names:
-        sys.exit(f"[MCQ] Error: Collection '{topic}' not found in session {session_id}.")
-    collection = client.get_collection(name=topic)
-    return collection, topic, session_folder
+    # Since there is only one collection in the database, we always fallback to it.
+    return load_single_collection(session_id)
 
 def fetch_combined_text(collection):
     """
@@ -149,7 +138,7 @@ def parse_mcq_output(raw_text: str):
         if not line:
             continue
 
-        match_q = re.match(r'^(?i)(\d+)\.\s*(.*)$', line)  # inline flag moved to front
+        match_q = re.match(r'^(?i)(\d+)\.\s*(.*)$', line)
         if match_q:
             if current["question"] or current["options"] or current["answer"] or current["explanation"]:
                 mcqs.append(current)
@@ -208,7 +197,7 @@ def parse_mcq_output(raw_text: str):
                 "explanation": expl
             })
     if not final_mcqs:
-        # Fallback: in case no valid MCQs were extracted
+        # Fallback in case no valid MCQs were extracted
         fallback_mcq = {
             "question": "MCQ Generation Failed",
             "options": ["A) N/A", "B) N/A", "C) N/A", "D) N/A"],
@@ -221,23 +210,25 @@ def parse_mcq_output(raw_text: str):
         final_mcqs.append(fallback_mcq)
     return final_mcqs
 
-
 def generate_title(text: str) -> str:
     """
-    Uses an LLM call to generate a creative title for the MCQs based on the provided text.
+    Uses an LLM call to generate a creative, concise, and formal title for the MCQs based on the provided text.
     Only the first 500 characters are used for efficiency.
+    The instruction forces exactly one concise sentence of about five words.
     """
     sample_text = text[:500]
     prompt = (
-        "You are an AI assistant. Based on the following content, generate a creative and concise title "
-        "for a set of multiple-choice questions (MCQs) that captures the main subject.\n\n"
-        "stricly answer in one small sentence with approx five"
+        "You are an AI assistant. Based on the following content, generate a creative, concise, and formal title "
+        "for a set of multiple-choice questions (MCQs) that captures the main subject. Answer in exactly one concise sentence of about five words. Do not provide multiple options or any extra commentary.\n\n"
         f"Content:\n{sample_text}\n\n"
         "Title:"
     )
     try:
         resp = ollama.generate(model="llama3.1", prompt=prompt)
         title = resp.get("response", "").strip()
+        # Use only the first line of the response and strip extraneous quotes.
+        title = title.splitlines()[0] if title else ""
+        title = title.strip(' "')
         return title if title else "Untitled MCQs"
     except Exception as e:
         return "Untitled MCQs"
@@ -248,29 +239,10 @@ def parse_args():
     parser.add_argument("--all", action="store_true",
                         help="Generate MCQs for all collections in the session.")
     parser.add_argument("--topic", type=str, default=None,
-                        help="Generate MCQs for a specific topic from the content. If the topic does not match a collection name, the single collection will be used and the prompt adjusted to focus on the topic.")
+                        help="Generate MCQs for a specific topic from the content. In this system, content is in one collection, so the topic will be used to focus the prompt.")
     parser.add_argument("--title", type=str, default="",
                         help="Optional title for the MCQ output. If omitted, the AI will generate a title based on the content.")
     return parser.parse_args()
-
-def generate_title(text: str) -> str:
-    """
-    Uses an LLM call to generate a creative and concise title for the MCQs based on the provided text.
-    Only the first 500 characters are used to keep the prompt concise.
-    """
-    sample_text = text[:500]
-    prompt = (
-        "You are an AI assistant. Based on the following content, generate a creative, concise and formal title "
-        "for a set of multiple-choice questions that captures the main subject.\n\n"
-        f"Content:\n{sample_text}\n\n"
-        "Title:"
-    )
-    try:
-        resp = ollama.generate(model="llama3.1", prompt=prompt)
-        title = resp.get("response", "").strip()
-        return title if title else "Untitled MCQs"
-    except Exception as e:
-        return "Untitled MCQs"
 
 def main():
     args = parse_args()
@@ -285,9 +257,10 @@ def main():
             combined_text += fetch_combined_text(coll_obj) + "\n\n"
         base_title = combined_text
     elif args.topic:
+        # Since there is only one collection, simply load it.
         collection, coll_name, session_folder = load_single_collection(session_id)
         combined_text = fetch_combined_text(collection)
-        # Prepend the focus so the LLM emphasizes the desired topic.
+        # Prepend the desired focus so the LLM is cued to concentrate on that topic.
         combined_text = f"Focus on {args.topic}. " + combined_text
         base_title = combined_text
     else:
@@ -299,7 +272,7 @@ def main():
         print("[MCQ] No text found to generate MCQs!")
         sys.exit(0)
 
-    # Auto-generate a title if the --title flag is not specified.
+    # Auto-generate a title if --title is not provided.
     default_title = args.title if args.title else generate_title(base_title)
 
     print(f"[MCQ] Generating 20 MCQs for session='{session_id}'...")
@@ -323,7 +296,7 @@ def main():
     else:
         mcq_file = base_file
 
-    # Create an output dictionary that includes the generated title.
+    # Create output dictionary with title and MCQs.
     output_data = {
         "title": default_title,
         "mcqs": parsed

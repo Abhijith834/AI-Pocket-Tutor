@@ -21,6 +21,7 @@ from core.web_search import (
     summarize_article_content
 )
 import sys_msgs
+import shutil
 
 next_chat_session = None
 
@@ -108,9 +109,9 @@ def input_with_timeout(prompt, timeout):
                 resp = requests.get(front_end_url_ngrok, headers=ngrok_headers, timeout=2)
                 if resp.status_code != 200:
                     raise Exception(f"Ngrok response status: {resp.status_code}")
-                print("Using ngrok URL for cli-messages")
+                # print("Using ngrok URL for cli-messages")
             except Exception as e:
-                print("Ngrok fetch failed, falling back to localhost:5000:", e)
+                # print("Ngrok fetch failed, falling back to localhost:5000:", e)
                 resp = requests.get(front_end_url_local, timeout=2)
             
             if resp.status_code == 200:
@@ -261,7 +262,7 @@ def process_injected_file_command():
 def main(final_pdf_path=None):
     global messages_since_summary, last_input_time, next_chat_session
     last_input_time = time.time()
-
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if os.path.exists(CHAT_HISTORY_FILE):
         try:
             with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -332,7 +333,150 @@ def main(final_pdf_path=None):
             print("[System] Exit command received. Finalizing conversation.")
             finalize_leftover_messages()
             return next_chat_session
+        
+        # ----- TTS Command Handling -----
+        # Expected command format: tts (chat_2#0)
+        if user_input.lower().startswith("tts (") and user_input.endswith(")"):
+            # Extract the command inside the parentheses.
+            tts_command = user_input[user_input.find("(") + 1 : user_input.rfind(")")].strip()
+            # Expected pattern: chat_<sessionID>#<block_index>
+            pattern = re.compile(r"^(chat_\d+)#(\d+)$", re.IGNORECASE)
+            match = pattern.match(tts_command)
+            if match:
+                session_ref = match.group(1)         # e.g., "chat_2"
+                block_number = int(match.group(2))     # 0-indexed for assistant messages
+                # Build the chat history file path:
+                chat_history_file = os.path.join(BASE_DIR, "database", session_ref, "chat_history.json")
+                if not os.path.exists(chat_history_file):
+                    print(f"Chat history file not found for session {session_ref}")
+                    continue
+                try:
+                    with open(chat_history_file, "r", encoding="utf-8") as f:
+                        history_data = json.load(f)
+                    chat_history = history_data.get("chat_history", [])
+                except Exception as e:
+                    print(f"Failed to load chat history for {session_ref}: {e}")
+                    continue
+                # Filter for assistant messages only (indexed from 0)
+                assistant_messages = [msg for msg in chat_history if msg.get("role", "").lower() == "assistant"]
+                if block_number < 0 or block_number >= len(assistant_messages):
+                    print(f"Invalid block number: {block_number} (total assistant messages: {len(assistant_messages)})")
+                    continue
+                tts_text = assistant_messages[block_number].get("content", "")
+                print(f"Extracted TTS text from {session_ref} assistant block {block_number}:\n{tts_text}")
+            else:
+                # If no pattern match, use the provided text directly.
+                tts_text = tts_command
+                print(f"Using direct TTS text: {tts_text}")
 
+            # Build the TTS script path.
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "Text_to_Speach.py")
+            if not os.path.exists(script_path):
+                alt_script_path = script_path + ".py"
+                if os.path.exists(alt_script_path):
+                    script_path = alt_script_path
+                else:
+                    print(f"Error: TTS script not found at {script_path} or {alt_script_path}")
+                    continue
+
+            print(f"Using TTS script at: {script_path}")
+            try:
+                subprocess.run(["python", script_path, tts_text], check=True)
+                print("TTS conversion completed successfully.")
+            except subprocess.CalledProcessError as e:
+                print("TTS subprocess failed:", e)
+                continue
+
+            # Assume the TTS script writes the audio file to "output.wav" in the tools folder.
+            source_audio_path = os.path.join(os.path.dirname(script_path), "output.wav")
+            if not os.path.exists(source_audio_path):
+                print("Audio file not found after TTS conversion.")
+                continue
+
+            # Build the destination folder under the corresponding session's database.
+            dest_folder = os.path.join(BASE_DIR, "database", session_ref, "tts")
+            os.makedirs(dest_folder, exist_ok=True)
+            # Save the audio file with the name "chat_2#0.wav" (using the received command)
+            dest_filename = f"{session_ref}#{block_number}.wav"
+            dest_audio_path = os.path.join(dest_folder, dest_filename)
+
+            try:
+                # Move (rename) the audio file to the destination folder.
+                shutil.move(source_audio_path, dest_audio_path)
+                print(f"Audio file saved as: {dest_audio_path}")
+            except Exception as ex:
+                print("Error saving audio file:", ex)
+                continue
+
+            # Now send the audio file to the front end.
+            try:
+                tts_endpoint = f"http://localhost:5000/api/tts/{session_ref}"
+                with open(dest_audio_path, "rb") as audio_file:
+                    files = {"file": audio_file}
+                    # Optionally, you might also pass the desired file name.
+                    data = {"filename": dest_filename}
+                    response = requests.post(tts_endpoint, files=files, data=data)
+                if response.status_code == 200:
+                    print("Audio file sent to front end successfully.")
+                else:
+                    print(f"Failed to send audio file. HTTP status code: {response.status_code}")
+            except Exception as ex:
+                print("Error sending audio file to front end:", ex)
+            # Continue with next input.
+            continue
+        # ----- End TTS Command Handling -----
+
+
+
+        # ----- Start STT Command Handling -----
+        if user_input.lower().startswith("stt (") and user_input.endswith(")"):
+            # Extract audio file path
+            audio_path = user_input[user_input.find("(")+1:user_input.rfind(")")].strip()
+            print(f"Detected STT command. Transcribing file: {audio_path}")
+
+            if not os.path.exists(audio_path):
+                print(f"Error: File not found: {audio_path}")
+                continue
+
+            # Construct the path to the Speach_to_Text.py script
+            script_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "tools", "Speach_to_Text.py"
+            )
+            if not os.path.exists(script_path):
+                alt_script_path = script_path + ".py"
+                if os.path.exists(alt_script_path):
+                    script_path = alt_script_path
+                else:
+                    print(f"Error: STT script not found at {script_path} or {alt_script_path}")
+                    continue
+
+            print(f"Using STT script at: {script_path}")
+
+            # Prepare the output path
+            import tempfile
+            output_file = tempfile.mktemp(suffix="_transcription.txt")
+
+            try:
+                subprocess.run(["python", script_path, audio_path, output_file], check=True)
+                print("STT transcription completed successfully.")
+            except subprocess.CalledProcessError as e:
+                print("STT subprocess failed:", e)
+                continue
+
+            # Read and display the transcription
+            if os.path.exists(output_file):
+                try:
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        transcription = f.read().strip()
+                    print(f"Transcription result:\n\n{transcription}\n")
+                except Exception as e:
+                    print("Error reading transcription file:", e)
+            else:
+                print("Error: Output transcription file not found.")
+
+            continue  # Skip further processing for this input
+        # ----- End STT Command Handling -----
         if user_input.lower() in ["new chat(normal)", "new chat (normal)"]:
             print("[System] Creating a new NORMAL chat session now.")
             finalize_leftover_messages()
