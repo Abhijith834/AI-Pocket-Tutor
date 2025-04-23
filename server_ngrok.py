@@ -11,6 +11,7 @@ from watchdog.events import FileSystemEventHandler
 import urllib.parse
 from core import db_utils, chat, config
 from core.learning_mode import LearningModeAgent
+import traceback
 
 import session_config
 session_id = session_config.session_id
@@ -174,14 +175,21 @@ def ingest_file():
 
 @app.route("/api/learning-mode", methods=["POST"])
 def start_learning_mode():
-    agent = LearningModeAgent()
-    agent.init_learning_mode()
-    final_pdf_path = agent.final_pdf_path
-    print(f"[Server] Learning mode completed. Final PDF: {final_pdf_path}")
+    data    = request.get_json(force=True) or {}
+    file_p  = data.get("file_path",    "").strip() or None
+    subject = data.get("subject",      "").strip() or None
+
+    # Always headless for API
+    from core.learning_mode import LearningModeAgent
+    agent = LearningModeAgent(interactive=False)
+    agent.init_learning_mode(file_path=file_p, subject=subject)
+
     return jsonify({
         "message": "Learning mode completed",
-        "final_pdf_path": final_pdf_path
+        "final_pdf_path": agent.final_pdf_path
     }), 200
+
+
 
 @app.route("/api/database/export", methods=["GET"])
 def export_database():
@@ -283,29 +291,39 @@ def get_database_pdf():
     except Exception as e:
         return jsonify({"error": f"Could not send file: {str(e)}"}), 500
     
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "AI-Pocket-Tutor"))
 
+
+from datetime import datetime, timezone
 @app.route("/api/transcribe", methods=["POST"])
 def receive_audio():
-    # Get the audio file and session_id from the request.
     audio_file = request.files.get("audio")
     session_id = request.form.get("session_id")
-
     if not audio_file or not session_id:
+        print("Error: Missing audio file or session_id.")
         return jsonify({"status": "error", "message": "Missing audio or session_id"}), 400
 
-    # Set up the session folder and "stt" subfolder.
-    folder_path = os.path.join(BASE_DIR, f"chat_{session_id}", "stt")
+    folder_path = os.path.join(BASE_DIR, "database", f"chat_{session_id}", "stt")
     os.makedirs(folder_path, exist_ok=True)
+    print(f"DEBUG: Saving files under: {folder_path}")
 
-    # Save the audio file.
     file_path = os.path.join(folder_path, audio_file.filename)
+    print(f"DEBUG: Saving audio file to: {file_path}")
     audio_file.save(file_path)
 
-    # Form the public URL for the saved file.
-    public_url = f"http://localhost:5000/api/database/chat_{session_id}/stt/{audio_file.filename}"
+    # Build the URL that your front end can later fetch
+    encoded = urllib.parse.quote(audio_file.filename)
+    public_url = f"http://localhost:5000/api/database/chat_{session_id}/stt/{encoded}"
+    print(f"DEBUG: Saved. audio_url = {public_url}")
 
-    return jsonify({"status": "saved", "path": file_path, "url": public_url}), 200
+    return jsonify({
+        "status":      "saved",
+        "audio_path":  file_path,
+        "audio_url":   public_url
+    }), 200
+
+
+
 
 @app.route("/api/tts/<session>", methods=["POST"])
 def receive_tts_audio(session):
@@ -343,18 +361,19 @@ def receive_tts_audio(session):
 @app.route("/api/tts/<session>/<filename>", methods=["GET"])
 def serve_tts_audio(session, filename):
     """
-    Serves the audio file from:
+    Serves an audio file located at:
       BASE_DIR/database/<session>/tts/<filename>
-    Logs the computed file path for debugging.
+    It logs the computed file path for debugging purposes.
     """
     file_path = os.path.join(BASE_DIR, "database", session, "tts", filename)
-    print(f"GET Request for session: {session}, filename: {filename}")
-    print(f"Computed file path: {file_path}")
-    if not os.path.exists(file_path):
-        print(f"File not found at: {file_path}")
-        return jsonify({"status": "error", "message": "File not found"}), 404
-    return send_file(file_path, mimetype="audio/wav", as_attachment=False)
+    print(f"[DEBUG] GET Request for session: '{session}', filename: '{filename}'")
+    print(f"[DEBUG] Computed absolute path: {file_path}")
     
+    if not os.path.exists(file_path):
+        print(f"[DEBUG] File not found at: {file_path}")
+        return jsonify({"status": "error", "message": "File not found", "searched_for": file_path}), 404
+
+    return send_file(file_path, mimetype="audio/wav", as_attachment=False)
 @app.route("/api/database/session-state", methods=["GET"])
 def get_session_state():
     try:

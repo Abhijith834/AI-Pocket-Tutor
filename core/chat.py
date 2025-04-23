@@ -334,6 +334,39 @@ def main(final_pdf_path=None):
             finalize_leftover_messages()
             return next_chat_session
         
+
+        # MCQ trigger
+        # inside your input loop in chat.main(), replace the MCQ block with:
+        if user_input.strip().lower().startswith("(mcq"):
+            session_id = os.environ.get("SESSION_ID", "")
+            if not session_id:
+                print("[MCQ] No session_id found. Cannot generate MCQs.")
+                continue
+
+            mcq_match = re.match(r'^\(\s*mcq(?:\s+(.*))?\)$', user_input.strip(), re.IGNORECASE)
+            extra = mcq_match.group(1) if mcq_match else None
+
+            print("[Chat] Generating MCQs in a separate process...")
+            script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools", "MCQ.py"))
+            cmd = [sys.executable, script, session_id]
+            if extra:
+                extra = extra.strip()
+                tm = re.match(r'^topic\s*=\s*(.+)$', extra, re.IGNORECASE)
+                if tm:
+                    cmd += ["--topic", tm.group(1).strip()]
+                else:
+                    tm2 = re.match(r'^title\s*=\s*(.+)$', extra, re.IGNORECASE)
+                    if tm2:
+                        cmd += ["--title", tm2.group(1).strip().strip('"').strip("'")]
+
+            try:
+                subprocess.run(cmd, check=True)
+                print("[Chat] MCQ generation complete.\n")
+            except subprocess.CalledProcessError as e:
+                print(f"[MCQ] Error generating MCQs: {e}")
+            continue
+
+
         # ----- TTS Command Handling -----
         # Expected command format: tts (chat_2#0)
         if user_input.lower().startswith("tts (") and user_input.endswith(")"):
@@ -430,53 +463,72 @@ def main(final_pdf_path=None):
 
         # ----- Start STT Command Handling -----
         if user_input.lower().startswith("stt (") and user_input.endswith(")"):
-            # Extract audio file path
-            audio_path = user_input[user_input.find("(")+1:user_input.rfind(")")].strip()
-            print(f"Detected STT command. Transcribing file: {audio_path}")
+            # pull out the base name (e.g. “1745422463166”)
+            name = user_input[user_input.find("(")+1 : -1]
+            print(f"Detected STT command. Looking for audio file named: {name}")
+
+            # Construct the .wav path under database/chat_<session>/stt/
+            session = os.environ.get("SESSION_ID", "")
+            audio_path = os.path.join(
+                BASE_DIR, "database", f"chat_{session}", "stt", f"{name}.webm"
+            )
+            print(f"DEBUG: Checking for audio at path: {audio_path}")
 
             if not os.path.exists(audio_path):
-                print(f"Error: File not found: {audio_path}")
+                print("STT response: {'status':'error','message':'file not found'}")
                 continue
 
-            # Construct the path to the Speach_to_Text.py script
-            script_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
+            # call your Speach_to_Text module:
+            stt_script = os.path.join(
+                os.path.dirname(__file__),
                 "..", "tools", "Speach_to_Text.py"
             )
-            if not os.path.exists(script_path):
-                alt_script_path = script_path + ".py"
-                if os.path.exists(alt_script_path):
-                    script_path = alt_script_path
+            if not os.path.exists(stt_script):
+                alt = stt_script + ".py"
+                if os.path.exists(alt):
+                    stt_script = alt
                 else:
-                    print(f"Error: STT script not found at {script_path} or {alt_script_path}")
+                    print("STT response: {'status':'error','message':'STT script not found.'}")
                     continue
 
-            print(f"Using STT script at: {script_path}")
-
-            # Prepare the output path
-            import tempfile
-            output_file = tempfile.mktemp(suffix="_transcription.txt")
-
+            out_txt = os.path.splitext(audio_path)[0] + "_transcript.txt"
+            print(f"DEBUG: Running STT script -> {stt_script}")
             try:
-                subprocess.run(["python", script_path, audio_path, output_file], check=True)
-                print("STT transcription completed successfully.")
-            except subprocess.CalledProcessError as e:
-                print("STT subprocess failed:", e)
+                subprocess.run(
+                    ["python", stt_script, audio_path, out_txt],
+                    check=True
+                )
+                with open(out_txt, "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                print(f"STT response: {{'status':'ok','transcription': {txt!r}}}")
+            except Exception as e:
+                print(f"STT response: {{'status':'error','message':{e!r}}}")
                 continue
 
-            # Read and display the transcription
-            if os.path.exists(output_file):
-                try:
-                    with open(output_file, "r", encoding="utf-8") as f:
-                        transcription = f.read().strip()
-                    print(f"Transcription result:\n\n{transcription}\n")
-                except Exception as e:
-                    print("Error reading transcription file:", e)
-            else:
-                print("Error: Output transcription file not found.")
+            # --- feed the transcript into the chat as if the user had typed it ---
+            print(f"[Chat] Injecting transcription into chat: {txt}")
+            db_utils.chat_history.append({"role": "user", "content": txt})
+            unsummarized_messages.append({"role": "user", "content": txt})
+            db_utils.save_session_state()
+            messages_since_summary += 1
+            summarize_if_needed()
 
-            continue  # Skip further processing for this input
+            # now get the bot’s reply
+            answer = master_answer_flow(txt)
+            print(f"Chatbot: {answer}\n")
+            db_utils.chat_history.append({"role": "assistant", "content": answer})
+            unsummarized_messages.append({"role": "assistant", "content": answer})
+            db_utils.save_session_state()
+            messages_since_summary += 1
+            if len(unsummarized_messages) >= MEMORY_UPDATE_THRESHOLD:
+                db_utils.update_memory_summary(unsummarized_messages)
+                unsummarized_messages.clear()
+
+            continue
         # ----- End STT Command Handling -----
+
+
+
         if user_input.lower() in ["new chat(normal)", "new chat (normal)"]:
             print("[System] Creating a new NORMAL chat session now.")
             finalize_leftover_messages()

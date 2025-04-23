@@ -10,140 +10,119 @@ logging.getLogger("chromadb").setLevel(logging.ERROR)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, current_dir)
 
-# Path to the shared session state file
-database_root = os.path.join(current_dir, "database")
-os.makedirs(database_root, exist_ok=True)
+database_root      = os.path.join(current_dir, "database")
 session_state_file = os.path.join(database_root, "session_state.json")
+os.makedirs(database_root, exist_ok=True)
 
-def load_session_state():
-    """
-    Load the session state from database/session_state.json.
-    Returns the session id if available, else an empty string.
-    """
+def load_session_state() -> str:
     if os.path.exists(session_state_file):
         try:
             with open(session_state_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            session_id = state.get("session_id", "")
-            print(f"[Main] Loaded session state from file: session_id = {session_id}")
-            return session_id
-        except Exception as e:
-            print(f"[Main] Error loading session state file: {e}")
+                return json.load(f).get("session_id", "")
+        except:
+            pass
     return ""
 
-def save_session_state_to_file(new_session_id):
-    """
-    Save the session state (session id) to database/session_state.json.
-    """
+def save_session_state_to_file(sid: str) -> None:
     try:
-        state = {"session_id": new_session_id}
         with open(session_state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=4)
-        print(f"[Main] Saved session state: session_id = {new_session_id}")
-    except Exception as e:
-        print(f"[Main] Error writing session state: {e}")
+            json.dump({"session_id": sid}, f, indent=4)
+    except:
+        pass
 
 def initialize_session():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--session", type=str, default="", help="Jump directly to an existing session.")
-    group.add_argument("--newchat", type=str, default="", help="Force creation of a new chat session (normal or learning).")
-    args, unknown = parser.parse_known_args()
+    group.add_argument("--session",       type=str, default="", help="Use existing session")
+    group.add_argument("--newchat",       type=str, default="", help="Create new chat (normal|learning)")
 
-    # Priority: command-line argument → session state file → user prompt.
+    # ← NEW: flags for learning‐mode ingestion
+    parser.add_argument("--learning-file",    type=str, default="", help="Path to PDF for learning mode")
+    parser.add_argument("--learning-subject", type=str, default="", help="Search subject for PDF")
+
+    args, _ = parser.parse_known_args()
+
+    # 1) Explicit flags
     if args.session:
-        return args.session, False, None
+        return args, args.session, False, None
     if args.newchat:
-        return "", True, args.newchat.lower()
-    
-    stored_session = load_session_state()
-    if stored_session:
-        return stored_session, False, None
+        return args, "", True, args.newchat.lower()
 
-    chat_session = input("Enter chat session number (or press Enter to create a new session): ").strip()
-    is_new_session = (chat_session == "")
-    new_chat_mode = None
-    if is_new_session:
-        new_chat_mode = input("Which mode do you want for this new session? (enter 'learning' or 'normal'): ").strip().lower()
-    return chat_session, is_new_session, new_chat_mode
+    # 2) Stored session
+    stored = load_session_state()
+    if stored:
+        return args, stored, False, None
 
-def update_session_state(new_session_id):
+    # 3) Interactive fallback for session id
+    sid = input("Enter chat session (or Enter for new): ").strip()
+    is_new = sid == ""
+    mode   = None
+    if is_new:
+        mode = input("Which mode? (normal|learning): ").strip().lower()
+    return args, sid, is_new, mode
+
+def update_session_state(sid: str):
     import session_config
-    session_config.session_id = new_session_id
-    session_folder = os.path.join(database_root, f"chat_{new_session_id}")
-    os.makedirs(session_folder, exist_ok=True)
-    os.environ["CHAT_HISTORY_FILE"] = os.path.join(session_folder, "chat_history.json")
-    os.environ["CHROMA_DB_DIR"] = os.path.join(session_folder, "chromadb_storage")
-    os.environ["SESSION_ID"] = new_session_id
-    print(f"[Main] Now using chat session: {new_session_id}")
+    session_config.session_id = sid
+    folder = os.path.join(database_root, f"chat_{sid}")
+    os.makedirs(folder, exist_ok=True)
+    os.environ.update({
+        "CHAT_HISTORY_FILE": os.path.join(folder, "chat_history.json"),
+        "CHROMA_DB_DIR"   : os.path.join(folder, "chromadb_storage"),
+        "SESSION_ID"      : sid
+    })
     from core import db_utils
     db_utils.load_session_state()
-    # Also update the persistent session state file.
-    save_session_state_to_file(new_session_id)
+    save_session_state_to_file(sid)
+
+def get_next_session_id() -> str:
+    nums = []
+    for d in os.listdir(database_root):
+        if d.startswith("chat_"):
+            suf = d.split("_",1)[1]
+            if suf.isdigit():
+                nums.append(int(suf))
+    return str(max(nums)+1 if nums else 1)
 
 if __name__ == "__main__":
-    # Initialize session from command-line, session state file, or prompt.
-    chat_session, is_new_session, new_chat_mode = initialize_session()
-    if chat_session:
-        session_id_str = chat_session
-    else:
-        # Create a new session id by scanning the database folder if no session was provided.
-        existing_sessions = [d for d in os.listdir(database_root) if os.path.isdir(os.path.join(database_root, d))]
-        max_id = 0
-        for d in existing_sessions:
-            try:
-                num = int(d.split("_")[-1])
-                if num > max_id:
-                    max_id = num
-            except:
-                continue
-        session_id_str = str(max_id + 1)
-    update_session_state(session_id_str)
-    print(f"[Main] Using chat session: {session_id_str}")
-    print(f"[Main] Session folder: {os.path.join(database_root, 'chat_' + session_id_str)}")
+    args, chat_session, is_new, new_mode = initialize_session()
+    session_id = chat_session or get_next_session_id()
+    update_session_state(session_id)
 
-    from core import chat, db_utils, config
-    db_utils.load_session_state()
+    print(f"[Main] Using chat session: {session_id}")
 
-    if db_utils.memory_summary:
-        print("[Main] Loaded memory summary for this session.")
-
+    # ─── Learning Mode: only via CLI flags, no prompts ────────────────
     final_pdf_path = None
-    if is_new_session and new_chat_mode == "learning" and config.LEARNING_MODE:
+    from core import config
+    if is_new and new_mode == "learning" and config.LEARNING_MODE:
         from core.learning_mode import LearningModeAgent
         agent = LearningModeAgent()
-        agent.init_learning_mode()
+        fp = args.learning_file    or None
+        sb = args.learning_subject or None
+        agent.init_learning_mode(file_path=fp, subject=sb)
         final_pdf_path = agent.final_pdf_path
 
+    # ─── Hand off to chat loop ──────────────────────────────────────
+    from core import chat
     print("\nSwitching to normal chat mode.\n")
-
     result = chat.main(final_pdf_path=final_pdf_path)
 
+    # ─── Post‐chat routing (unchanged) ───────────────────────────────
     python_exe = sys.executable
-    script_path = os.path.abspath(__file__)
-
-    # Process the result from chat.main
+    script     = os.path.abspath(__file__)
     if isinstance(result, str):
-        # Case: result is a session-switch command formatted as "chat (10)"
         if result.startswith("chat (") and result.endswith(")"):
-            new_session = result[len("chat ("):-1].strip()
-            print(f"[Main] Detected session switch command: {result}")
-            update_session_state(new_session)
-            subprocess.run([python_exe, script_path, "--session", new_session], check=False)
+            sid = result[6:-1].strip()
+            subprocess.run([python_exe, script, "--session", sid], check=False)
             sys.exit(0)
-        # Case: NEWCHAT command
-        elif result.startswith("NEWCHAT:"):
-            mode = result.split(":")[1].strip().lower()
-            new_session = input("Enter new session id: ").strip()
-            update_session_state(new_session)
-            subprocess.run([python_exe, script_path, "--newchat", mode], check=False)
+        if result.startswith("NEWCHAT:"):
+            m = result.split(":",1)[1].strip().lower()
+            subprocess.run([python_exe, script, "--newchat", m], check=False)
             sys.exit(0)
-        # Case: plain digit (session id)
-        elif result.isdigit():
-            update_session_state(result)
-            subprocess.run([python_exe, script_path, "--session", result], check=False)
+        if result.isdigit():
+            subprocess.run([python_exe, script, "--session", result], check=False)
             sys.exit(0)
 
-    print("\nChat session ended. Restarting the program now...\n")
-    subprocess.run([python_exe, script_path] + sys.argv[1:], check=False)
+    # default restart
+    subprocess.run([python_exe, script, "--session", session_id] + sys.argv[1:], check=False)
     sys.exit(0)
